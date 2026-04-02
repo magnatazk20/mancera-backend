@@ -364,6 +364,55 @@
   font-size: 0.88rem;
 }
 
+.admin-form-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.admin-form-group {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-form-group span {
+  color: #b5c2e2;
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.admin-form-group input,
+.admin-form-group textarea {
+  width: 100%;
+  background: rgba(11, 18, 33, 0.82);
+  color: #e9eefc;
+  border: 1px solid #2e4577;
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.admin-form-group input:focus,
+.admin-form-group textarea:focus {
+  border-color: #4f76c7;
+  box-shadow: 0 0 0 2px rgba(79, 118, 199, 0.2);
+}
+
+.admin-primary-btn {
+  background: linear-gradient(180deg, #22355f, #1a2b4d);
+  color: #e8efff;
+  border: 1px solid #3b5a99;
+  border-radius: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.admin-primary-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .admin-withdraw-cards {
   display: none;
 }

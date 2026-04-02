@@ -16,6 +16,7 @@ export default function AdminSiteSettings() {
   const [success, setSuccess] = useState('')
   const [siteTitle, setSiteTitle] = useState('')
   const [siteDescription, setSiteDescription] = useState('')
+  const [siteLogoUrl, setSiteLogoUrl] = useState('')
 
   useEffect(() => {
     const loadSettings = async () => {
@@ -34,6 +35,7 @@ export default function AdminSiteSettings() {
           settings?: {
             siteTitle?: string
             siteDescription?: string
+            siteLogoUrl?: string
           }
         }
 
@@ -44,6 +46,7 @@ export default function AdminSiteSettings() {
 
         setSiteTitle(String(data.settings?.siteTitle ?? ''))
         setSiteDescription(String(data.settings?.siteDescription ?? ''))
+        setSiteLogoUrl(String(data.settings?.siteLogoUrl ?? ''))
       } catch {
         setError('Erro de conexão ao carregar configurações.')
       } finally {
@@ -69,6 +72,7 @@ export default function AdminSiteSettings() {
         body: JSON.stringify({
           siteTitle: siteTitle.trim(),
           siteDescription: siteDescription.trim(),
+          siteLogoUrl: siteLogoUrl.trim(),
         }),
       })
 
@@ -99,7 +103,7 @@ export default function AdminSiteSettings() {
           <div>
             <h1>Editar Site</h1>
             <p className="admin-subtitle">
-              Altere o título e a descrição do site e salve no banco de dados.
+              Altere o título, descrição e logo do site e salve no banco de dados.
             </p>
           </div>
         </header>
@@ -115,7 +119,7 @@ export default function AdminSiteSettings() {
           {success ? <p className="admin-chip soft">{success}</p> : null}
 
           <div className="admin-form-grid" style={{ marginTop: 16 }}>
-            <label style={{ display: 'grid', gap: 6 }}>
+            <label className="admin-form-group">
               <span>Título do site</span>
               <input
                 type="text"
@@ -126,7 +130,7 @@ export default function AdminSiteSettings() {
               />
             </label>
 
-            <label style={{ display: 'grid', gap: 6 }}>
+            <label className="admin-form-group">
               <span>Descrição do site</span>
               <textarea
                 value={siteDescription}
@@ -136,10 +140,21 @@ export default function AdminSiteSettings() {
                 maxLength={1000}
               />
             </label>
+
+            <label className="admin-form-group">
+              <span>Foto/logo do site (URL)</span>
+              <input
+                type="url"
+                value={siteLogoUrl}
+                onChange={(e) => setSiteLogoUrl(e.target.value)}
+                placeholder="https://seusite.com/logo.png"
+                maxLength={500}
+              />
+            </label>
           </div>
 
           <div style={{ marginTop: 16 }}>
-            <button type="button" onClick={saveSettings} disabled={saving || loading}>
+            <button className="admin-primary-btn" type="button" onClick={saveSettings} disabled={saving || loading}>
               {saving ? 'Salvando...' : 'Salvar alterações'}
             </button>
           </div>
