@@ -3530,6 +3530,7 @@ app.get('/api/site-settings', async (_req, res) => {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         site_title VARCHAR(150) NOT NULL DEFAULT '',
         site_description TEXT NULL,
+        site_logo_url VARCHAR(500) NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -3542,6 +3543,7 @@ app.get('/api/site-settings', async (_req, res) => {
       SELECT
         site_title AS siteTitle,
         site_description AS siteDescription,
+        site_logo_url AS siteLogoUrl,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
@@ -3555,6 +3557,7 @@ app.get('/api/site-settings', async (_req, res) => {
         settings: {
           siteTitle: '',
           siteDescription: '',
+          siteLogoUrl: '',
           updatedAt: null,
         },
       })
@@ -3566,6 +3569,7 @@ app.get('/api/site-settings', async (_req, res) => {
       settings: {
         siteTitle: String(rows[0].siteTitle ?? ''),
         siteDescription: String(rows[0].siteDescription ?? ''),
+        siteLogoUrl: String(rows[0].siteLogoUrl ?? ''),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -3583,6 +3587,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         site_title VARCHAR(150) NOT NULL DEFAULT '',
         site_description TEXT NULL,
+        site_logo_url VARCHAR(500) NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -3596,6 +3601,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
         id,
         site_title AS siteTitle,
         site_description AS siteDescription,
+        site_logo_url AS siteLogoUrl,
         updated_at AS updatedAt
       FROM site_settings
       ORDER BY id ASC
@@ -3606,8 +3612,8 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
     if (rows.length === 0) {
       await pool.query(
         `
-        INSERT INTO site_settings (site_title, site_description)
-        VALUES ('', '')
+        INSERT INTO site_settings (site_title, site_description, site_logo_url)
+        VALUES ('', '', '')
         `
       )
 
@@ -3616,6 +3622,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
         settings: {
           siteTitle: '',
           siteDescription: '',
+          siteLogoUrl: '',
           updatedAt: null,
         },
       })
@@ -3627,6 +3634,7 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
       settings: {
         siteTitle: String(rows[0].siteTitle ?? ''),
         siteDescription: String(rows[0].siteDescription ?? ''),
+        siteLogoUrl: String(rows[0].siteLogoUrl ?? ''),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -3637,13 +3645,15 @@ app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
-  const { siteTitle, siteDescription } = req.body as {
+  const { siteTitle, siteDescription, siteLogoUrl } = req.body as {
     siteTitle?: string
     siteDescription?: string
+    siteLogoUrl?: string
   }
 
   const parsedSiteTitle = String(siteTitle ?? '').trim()
   const parsedSiteDescription = String(siteDescription ?? '').trim()
+  const parsedSiteLogoUrl = String(siteLogoUrl ?? '').trim()
 
   if (!parsedSiteTitle) {
     res.status(400).json({ ok: false, error: 'Título do site é obrigatório.' })
@@ -3657,12 +3667,24 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         site_title VARCHAR(150) NOT NULL DEFAULT '',
         site_description TEXT NULL,
+        site_logo_url VARCHAR(500) NULL,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
       )
       `
     )
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE site_settings
+        ADD COLUMN site_logo_url VARCHAR(500) NULL
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM site_settings ORDER BY id ASC LIMIT 1'
@@ -3671,10 +3693,10 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
     if (rows.length === 0) {
       await pool.query(
         `
-        INSERT INTO site_settings (site_title, site_description)
-        VALUES (?, ?)
+        INSERT INTO site_settings (site_title, site_description, site_logo_url)
+        VALUES (?, ?, ?)
         `,
-        [parsedSiteTitle, parsedSiteDescription]
+        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl]
       )
     } else {
       await pool.query(
@@ -3683,10 +3705,11 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
         SET
           site_title = ?,
           site_description = ?,
+          site_logo_url = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [parsedSiteTitle, parsedSiteDescription, Number(rows[0].id)]
+        [parsedSiteTitle, parsedSiteDescription, parsedSiteLogoUrl, Number(rows[0].id)]
       )
     }
 
@@ -3696,6 +3719,7 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
       settings: {
         siteTitle: parsedSiteTitle,
         siteDescription: parsedSiteDescription,
+        siteLogoUrl: parsedSiteLogoUrl,
       },
     })
   } catch (err) {
