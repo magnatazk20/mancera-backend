@@ -187,9 +187,11 @@ export default function AdminLogs() {
                           <small>
                             usuário: {log.userName ?? '-'} ({log.userPhone ?? '-'}) | entidade: {log.entityType}#{log.entityId ?? '-'}
                           </small>
-                          <small>
-                            saldo anterior: {log.oldBalance == null ? '-' : formatBRL(log.oldBalance)} | novo: {log.newBalance == null ? '-' : formatBRL(log.newBalance)} | valor: {log.amount == null ? '-' : formatBRL(log.amount)}
-                          </small>
+                          <div style={{ marginTop: 6, display: 'grid', gap: 2 }}>
+                            <small><strong>Saldo antigo:</strong> {log.oldBalance == null ? '-' : formatBRL(log.oldBalance)}</small>
+                            <small><strong>Saldo novo:</strong> {log.newBalance == null ? '-' : formatBRL(log.newBalance)}</small>
+                            <small><strong>Valor:</strong> {log.amount == null ? '-' : formatBRL(log.amount)}</small>
+                          </div>
                           {metadata ? (
                             <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', fontSize: 12 }}>
                               {typeof metadata === 'string' ? metadata : JSON.stringify(metadata, null, 2)}
