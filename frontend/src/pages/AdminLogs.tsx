@@ -176,31 +176,46 @@ export default function AdminLogs() {
               {(grouped[cat]?.length ?? 0) === 0 ? (
                 <p className="admin-log-hint">Sem registros nesta categoria.</p>
               ) : (
-                <div className="admin-user-list">
-                  {(grouped[cat] ?? []).map((log) => {
-                    const metadata = safeJson(log.metadata)
-                    return (
-                      <article key={log.id} className="admin-user-log-item">
-                        <div>
-                          <strong>{log.action}</strong>
-                          <p>{log.createdAt ? new Date(log.createdAt).toLocaleString('pt-BR') : '-'}</p>
-                          <small>
-                            usuário ID: {log.userId ?? '-'} | nome: {log.userName ?? '-'} ({log.userPhone ?? '-'}) | entidade: {log.entityType}#{log.entityId ?? '-'}
-                          </small>
-                          <div style={{ marginTop: 6, display: 'grid', gap: 2 }}>
-                            <small><strong>Saldo antigo:</strong> {log.oldBalance == null ? '-' : formatBRL(log.oldBalance)}</small>
-                            <small><strong>Saldo novo:</strong> {log.newBalance == null ? '-' : formatBRL(log.newBalance)}</small>
-                            <small><strong>Valor:</strong> {log.amount == null ? '-' : formatBRL(log.amount)}</small>
-                          </div>
-                          {metadata ? (
-                            <pre style={{ marginTop: 8, whiteSpace: 'pre-wrap', fontSize: 12 }}>
-                              {typeof metadata === 'string' ? metadata : JSON.stringify(metadata, null, 2)}
-                            </pre>
-                          ) : null}
-                        </div>
-                      </article>
-                    )
-                  })}
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Mensagem</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Usuário</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Entidade</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Saldo antigo</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Saldo novo</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Valor</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Metadata</th>
+                        <th style={{ textAlign: 'left', padding: '8px 6px' }}>Data</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(grouped[cat] ?? []).map((log) => {
+                        const metadata = safeJson(log.metadata)
+                        return (
+                          <tr key={log.id} style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                            <td style={{ padding: '8px 6px' }}>{log.action}</td>
+                            <td style={{ padding: '8px 6px' }}>{log.userId ?? '-'}</td>
+                            <td style={{ padding: '8px 6px' }}>{log.entityType}#{log.entityId ?? '-'}</td>
+                            <td style={{ padding: '8px 6px' }}>{log.oldBalance == null ? '-' : formatBRL(log.oldBalance)}</td>
+                            <td style={{ padding: '8px 6px' }}>{log.newBalance == null ? '-' : formatBRL(log.newBalance)}</td>
+                            <td style={{ padding: '8px 6px' }}>{log.amount == null ? '-' : formatBRL(log.amount)}</td>
+                            <td style={{ padding: '8px 6px', maxWidth: 320 }}>
+                              {metadata ? (
+                                <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: 12 }}>
+                                  {typeof metadata === 'string' ? metadata : JSON.stringify(metadata, null, 2)}
+                                </pre>
+                              ) : '-'}
+                            </td>
+                            <td style={{ padding: '8px 6px' }}>
+                              {log.createdAt ? new Date(log.createdAt).toLocaleString('pt-BR') : '-'}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </section>
