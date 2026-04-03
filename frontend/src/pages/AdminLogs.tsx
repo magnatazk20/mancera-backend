@@ -185,7 +185,7 @@ export default function AdminLogs() {
                           <strong>{log.action}</strong>
                           <p>{log.createdAt ? new Date(log.createdAt).toLocaleString('pt-BR') : '-'}</p>
                           <small>
-                            usuário: {log.userName ?? '-'} ({log.userPhone ?? '-'}) | entidade: {log.entityType}#{log.entityId ?? '-'}
+                            usuário ID: {log.userId ?? '-'} | nome: {log.userName ?? '-'} ({log.userPhone ?? '-'}) | entidade: {log.entityType}#{log.entityId ?? '-'}
                           </small>
                           <div style={{ marginTop: 6, display: 'grid', gap: 2 }}>
                             <small><strong>Saldo antigo:</strong> {log.oldBalance == null ? '-' : formatBRL(log.oldBalance)}</small>
