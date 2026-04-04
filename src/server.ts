@@ -3779,11 +3779,14 @@ const ensureGiftVoucherTables = async () => {
       paid_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
       discount_coupon VARCHAR(80) NOT NULL,
       redeem_reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      generated_gift_code VARCHAR(50) NULL,
+      generated_gift_code_id BIGINT UNSIGNED NULL,
       status ENUM('paid','cancelled') NOT NULL DEFAULT 'paid',
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       KEY idx_gift_voucher_purchases_user (user_id),
-      KEY idx_gift_voucher_purchases_voucher (gift_voucher_id)
+      KEY idx_gift_voucher_purchases_voucher (gift_voucher_id),
+      KEY idx_gift_voucher_purchases_generated_code_id (generated_gift_code_id)
     )
     `
   )
@@ -3893,7 +3896,6 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
         description,
         image_url AS imageUrl,
         price,
-        discount_coupon AS discountCoupon,
         redeem_reward_value AS redeemRewardValue,
         is_active AS isActive,
         created_at AS createdAt
@@ -3909,7 +3911,6 @@ app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
       description: String(row.description ?? ''),
       imageUrl: String(row.imageUrl ?? ''),
       price: Number(row.price ?? 0),
-      discountCoupon: String(row.discountCoupon ?? ''),
       redeemRewardValue: Number(row.redeemRewardValue ?? 0),
       isActive: Number(row.isActive ?? 0) === 1,
       createdAt: row.createdAt ?? null,
