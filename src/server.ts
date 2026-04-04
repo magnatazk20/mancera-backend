@@ -3688,6 +3688,7 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
 
     const rewardType = String(gift.rewardType ?? 'balance_credit')
     const rewardValue = Number(gift.rewardValue ?? 0)
+    const oldBalance = Number(userRows[0]?.balance ?? 0)
 
     await conn.query(
       `
@@ -3740,6 +3741,60 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
     )
 
     const updatedBalance = Number(updatedUserRows[0]?.balance ?? 0)
+
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    await conn.query(
+      `
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        old_balance,
+        new_balance,
+        amount,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        parsedUserId,
+        'gift_code',
+        Number(gift.id),
+        'gift_code_redeemed',
+        Number(oldBalance.toFixed(2)),
+        Number(updatedBalance.toFixed(2)),
+        Number(rewardValue.toFixed(2)),
+        JSON.stringify({
+          code: normalizedCode,
+          rewardType,
+          source: 'profile_page',
+        }),
+      ]
+    )
 
     await conn.commit()
 
