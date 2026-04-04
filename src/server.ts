@@ -3897,6 +3897,36 @@ const ensureGiftCodeTables = async () => {
   `)
 
   await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN is_listed_for_sale TINYINT(1) NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN image_url VARCHAR(500) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN sale_price DECIMAL(12,2) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN description TEXT NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN discount_coupon VARCHAR(80) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
+    ADD COLUMN discount_percent DECIMAL(8,2) NULL
+  `)
+
+  await tryAlter(`
     ALTER TABLE gift_code_redemptions
     MODIFY COLUMN metadata JSON NULL
   `)
@@ -3904,35 +3934,68 @@ const ensureGiftCodeTables = async () => {
 
 app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
   try {
-    await ensureGiftVoucherTables()
+    await ensureGiftCodeTables()
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
         id,
-        name,
+        code,
         description,
         image_url AS imageUrl,
-        price,
-        redeem_reward_value AS redeemRewardValue,
+        sale_price AS salePrice,
+        discount_coupon AS discountCoupon,
+        discount_percent AS discountPercent,
+        reward_value AS redeemRewardValue,
+        max_total_uses AS maxTotalUses,
+        used_count AS usedCount,
         is_active AS isActive,
+        is_listed_for_sale AS isListedForSale,
         created_at AS createdAt
-      FROM gift_vouchers
+      FROM gift_codes
       WHERE is_active = 1
+        AND is_listed_for_sale = 1
+        AND sale_price IS NOT NULL
+        AND sale_price > 0
+        AND (max_total_uses <= 0 OR used_count < max_total_uses)
       ORDER BY id DESC
       `
     )
 
-    const vouchers = rows.map((row) => ({
-      id: Number(row.id),
-      name: String(row.name ?? ''),
-      description: String(row.description ?? ''),
-      imageUrl: String(row.imageUrl ?? ''),
-      price: Number(row.price ?? 0),
-      redeemRewardValue: Number(row.redeemRewardValue ?? 0),
-      isActive: Number(row.isActive ?? 0) === 1,
-      createdAt: row.createdAt ?? null,
-    }))
+    const vouchers = rows.map((row) => {
+      const salePrice = Number(row.salePrice ?? 0)
+      const discountPercentRaw = row.discountPercent == null ? null : Number(row.discountPercent)
+      const discountPercent =
+        discountPercentRaw != null && Number.isFinite(discountPercentRaw) && discountPercentRaw > 0
+          ? Math.min(discountPercentRaw, 100)
+          : null
+      const finalPrice =
+        discountPercent != null
+          ? Number((salePrice * (1 - discountPercent / 100)).toFixed(2))
+          : salePrice
+
+      return {
+        id: Number(row.id),
+        name: String(row.code ?? ''),
+        code: String(row.code ?? ''),
+        description: String(row.description ?? ''),
+        imageUrl: String(row.imageUrl ?? ''),
+        price: finalPrice,
+        originalPrice: salePrice,
+        discountCoupon: String(row.discountCoupon ?? ''),
+        discountPercent,
+        redeemRewardValue: Number(row.redeemRewardValue ?? 0),
+        maxTotalUses: Number(row.maxTotalUses ?? 0),
+        usedCount: Number(row.usedCount ?? 0),
+        remainingUses:
+          Number(row.maxTotalUses ?? 0) > 0
+            ? Math.max(Number(row.maxTotalUses ?? 0) - Number(row.usedCount ?? 0), 0)
+            : null,
+        isActive: Number(row.isActive ?? 0) === 1,
+        isListedForSale: Number(row.isListedForSale ?? 0) === 1,
+        createdAt: row.createdAt ?? null,
+      }
+    })
 
     res.json({ ok: true, vouchers })
   } catch (err) {
@@ -4067,16 +4130,20 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
       return
     }
 
-    const [voucherRows] = await conn.query<RowDataPacket[]>(
+    const [giftCodeRows] = await conn.query<RowDataPacket[]>(
       `
       SELECT
         id,
-        name,
-        price,
+        code,
+        reward_value AS rewardValue,
+        max_total_uses AS maxTotalUses,
+        used_count AS usedCount,
+        is_active AS isActive,
+        is_listed_for_sale AS isListedForSale,
+        sale_price AS salePrice,
         discount_coupon AS discountCoupon,
-        redeem_reward_value AS redeemRewardValue,
-        is_active AS isActive
-      FROM gift_vouchers
+        discount_percent AS discountPercent
+      FROM gift_codes
       WHERE id = ?
       LIMIT 1
       FOR UPDATE
@@ -4084,28 +4151,61 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
       [parsedGiftVoucherId]
     )
 
-    if (voucherRows.length === 0 || Number(voucherRows[0].isActive ?? 0) !== 1) {
+    if (giftCodeRows.length === 0) {
       await conn.rollback()
-      res.status(404).json({ ok: false, error: 'Vale presente não encontrado ou inativo.' })
+      res.status(404).json({ ok: false, error: 'Código não encontrado.' })
       return
     }
 
-    const currentBalance = Number(userRows[0].balance ?? 0)
-    const voucherPrice = Number(voucherRows[0].price ?? 0)
-    const redeemRewardValue = Number(voucherRows[0].redeemRewardValue ?? 0)
+    const giftCode = giftCodeRows[0]
+    const isActive = Number(giftCode.isActive ?? 0) === 1
+    const isListedForSale = Number(giftCode.isListedForSale ?? 0) === 1
+    const maxTotalUses = Number(giftCode.maxTotalUses ?? 0)
+    const usedCount = Number(giftCode.usedCount ?? 0)
 
-    if (currentBalance < voucherPrice) {
+    if (!isActive || !isListedForSale) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Este código não está disponível para venda.' })
+      return
+    }
+
+    if (maxTotalUses > 0 && usedCount >= maxTotalUses) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Este código esgotou o limite de resgates.' })
+      return
+    }
+
+    const salePriceRaw = Number(giftCode.salePrice ?? 0)
+    if (!Number.isFinite(salePriceRaw) || salePriceRaw <= 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Preço de venda inválido para este código.' })
+      return
+    }
+
+    const discountPercentRaw = giftCode.discountPercent == null ? null : Number(giftCode.discountPercent)
+    const discountPercent =
+      discountPercentRaw != null && Number.isFinite(discountPercentRaw) && discountPercentRaw > 0
+        ? Math.min(discountPercentRaw, 100)
+        : null
+
+    const finalPrice =
+      discountPercent != null
+        ? Number((salePriceRaw * (1 - discountPercent / 100)).toFixed(2))
+        : Number(salePriceRaw.toFixed(2))
+
+    const currentBalance = Number(userRows[0].balance ?? 0)
+    if (currentBalance < finalPrice) {
       await conn.rollback()
       res.status(400).json({
         ok: false,
-        error: 'Saldo insuficiente para comprar este vale.',
-        required: voucherPrice,
+        error: 'Saldo insuficiente para comprar este código.',
+        required: finalPrice,
         available: currentBalance,
       })
       return
     }
 
-    const balanceAfter = Number((currentBalance - voucherPrice).toFixed(2))
+    const balanceAfter = Number((currentBalance - finalPrice).toFixed(2))
 
     await conn.query(
       `
@@ -4116,51 +4216,9 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
       [balanceAfter, parsedUserId]
     )
 
-    let generatedGiftCode = ''
-    for (let i = 0; i < 6; i++) {
-      const candidate = `GV${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 900 + 100)}`
-      const [existsRows] = await conn.query<RowDataPacket[]>(
-        'SELECT id FROM gift_codes WHERE code = ? LIMIT 1',
-        [candidate]
-      )
-      if (existsRows.length === 0) {
-        generatedGiftCode = candidate
-        break
-      }
-    }
-
-    if (!generatedGiftCode) {
-      await conn.rollback()
-      res.status(500).json({ ok: false, error: 'Não foi possível gerar código de presente.' })
-      return
-    }
-
-    const [giftCodeResult] = await conn.query(
-      `
-      INSERT INTO gift_codes
-      (
-        code,
-        reward_type,
-        reward_value,
-        max_total_uses,
-        used_count,
-        notes,
-        is_active,
-        starts_at,
-        expires_at,
-        created_by_user_id
-      )
-      VALUES (?, 'balance_credit', ?, 1, 0, ?, 1, NOW(), NULL, ?)
-      `,
-      [
-        generatedGiftCode,
-        Number(redeemRewardValue.toFixed(2)),
-        `Gerado pela compra do vale #${parsedGiftVoucherId}`,
-        parsedUserId,
-      ]
-    ) as any
-
-    const generatedGiftCodeId = Number(giftCodeResult?.insertId ?? 0)
+    const generatedGiftCode = String(giftCode.code ?? '').trim().toUpperCase()
+    const generatedGiftCodeId = Number(giftCode.id ?? 0)
+    const redeemRewardValue = Number(giftCode.rewardValue ?? 0)
 
     const [purchaseResult] = await conn.query(
       `
@@ -4180,8 +4238,8 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
       [
         parsedUserId,
         parsedGiftVoucherId,
-        Number(voucherPrice.toFixed(2)),
-        String(voucherRows[0].discountCoupon ?? ''),
+        Number(finalPrice.toFixed(2)),
+        String(giftCode.discountCoupon ?? ''),
         Number(redeemRewardValue.toFixed(2)),
         generatedGiftCode,
         generatedGiftCodeId || null,
@@ -4192,13 +4250,15 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
 
     res.json({
       ok: true,
-      message: 'Vale presente comprado com sucesso.',
+      message: 'Código comprado com sucesso.',
       generatedGiftCode,
       purchase: {
         id: Number(purchaseResult?.insertId ?? 0),
         giftVoucherId: parsedGiftVoucherId,
-        name: String(voucherRows[0].name ?? ''),
-        paidAmount: Number(voucherPrice.toFixed(2)),
+        name: generatedGiftCode,
+        paidAmount: Number(finalPrice.toFixed(2)),
+        originalPrice: Number(salePriceRaw.toFixed(2)),
+        discountPercent,
         redeemRewardValue: Number(redeemRewardValue.toFixed(2)),
         generatedGiftCode,
       },
@@ -4208,7 +4268,7 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
   } catch (err) {
     await conn.rollback()
     console.error('[gift-vouchers-purchase]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao comprar vale presente.' })
+    res.status(500).json({ ok: false, error: 'Erro ao comprar código.' })
   } finally {
     conn.release()
   }
@@ -4232,6 +4292,12 @@ app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
         starts_at AS startsAt,
         expires_at AS expiresAt,
         created_by_user_id AS createdByUserId,
+        is_listed_for_sale AS isListedForSale,
+        image_url AS imageUrl,
+        sale_price AS salePrice,
+        description,
+        discount_coupon AS discountCoupon,
+        discount_percent AS discountPercent,
         created_at AS createdAt
       FROM gift_codes
       ORDER BY id DESC
@@ -4250,6 +4316,12 @@ app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
       startsAt: row.startsAt ?? null,
       expiresAt: row.expiresAt ?? null,
       createdByUserId: row.createdByUserId == null ? null : Number(row.createdByUserId),
+      isListedForSale: Number(row.isListedForSale ?? 0) === 1,
+      imageUrl: String(row.imageUrl ?? ''),
+      salePrice: row.salePrice == null ? null : Number(row.salePrice),
+      description: String(row.description ?? ''),
+      discountCoupon: String(row.discountCoupon ?? ''),
+      discountPercent: row.discountPercent == null ? null : Number(row.discountPercent),
       createdAt: row.createdAt ?? null,
     }))
 
