@@ -3369,6 +3369,11 @@ const ensureGiftCodeTables = async () => {
 
   await tryAlter(`
     ALTER TABLE gift_codes
+    ADD COLUMN notes VARCHAR(255) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_codes
     MODIFY COLUMN reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit'
   `)
 
