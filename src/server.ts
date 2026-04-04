@@ -3290,6 +3290,234 @@ app.post('/api/withdraw/webhook', async (req, res) => {
   }
 })
 
+app.get('/api/admin/gift-codes', requireMaxAdmin, async (_req, res) => {
+  try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS gift_codes (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        code VARCHAR(50) NOT NULL,
+        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        max_total_uses INT NOT NULL DEFAULT 1,
+        used_count INT NOT NULL DEFAULT 0,
+        notes VARCHAR(255) NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        starts_at DATETIME NULL,
+        expires_at DATETIME NULL,
+        created_by_user_id BIGINT UNSIGNED NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_gift_codes_code (code),
+        KEY idx_gift_codes_active (is_active),
+        KEY idx_gift_codes_expires (expires_at)
+      )
+      `
+    )
+
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        gift_code_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        reward_applied TINYINT(1) NOT NULL DEFAULT 0,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_gift_code_redemption_once (gift_code_id, user_id),
+        KEY idx_gift_code_redemptions_user (user_id),
+        KEY idx_gift_code_redemptions_code (gift_code_id)
+      )
+      `
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        code,
+        reward_type AS rewardType,
+        reward_value AS rewardValue,
+        max_total_uses AS maxTotalUses,
+        used_count AS usedCount,
+        notes,
+        is_active AS isActive,
+        starts_at AS startsAt,
+        expires_at AS expiresAt,
+        created_by_user_id AS createdByUserId,
+        created_at AS createdAt
+      FROM gift_codes
+      ORDER BY id DESC
+      `
+    )
+
+    const giftCodes = rows.map((row) => ({
+      id: Number(row.id),
+      code: String(row.code ?? ''),
+      rewardType: String(row.rewardType ?? 'balance_credit'),
+      rewardValue: Number(row.rewardValue ?? 0),
+      maxTotalUses: Number(row.maxTotalUses ?? 0),
+      usedCount: Number(row.usedCount ?? 0),
+      notes: String(row.notes ?? ''),
+      isActive: Number(row.isActive ?? 0) === 1,
+      startsAt: row.startsAt ?? null,
+      expiresAt: row.expiresAt ?? null,
+      createdByUserId: row.createdByUserId == null ? null : Number(row.createdByUserId),
+      createdAt: row.createdAt ?? null,
+    }))
+
+    res.json({ ok: true, giftCodes })
+  } catch (err) {
+    console.error('[admin-gift-codes-list]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao listar códigos de presente.' })
+  }
+})
+
+app.post('/api/admin/gift-codes', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const {
+    code,
+    rewardType,
+    rewardValue,
+    maxTotalUses,
+    notes,
+    startsAt,
+    expiresAt,
+  } = req.body as {
+    code?: string
+    rewardType?: string
+    rewardValue?: number | string
+    maxTotalUses?: number | string
+    notes?: string
+    startsAt?: string | null
+    expiresAt?: string | null
+  }
+
+  const normalizedCode = String(code ?? '').trim().toUpperCase()
+  const normalizedRewardType = String(rewardType ?? 'balance_credit').trim() || 'balance_credit'
+  const normalizedRewardValue = Number(String(rewardValue ?? '0').replace(',', '.'))
+  const normalizedMaxTotalUses = Number(String(maxTotalUses ?? '1'))
+  const normalizedNotes = String(notes ?? '').trim()
+  const normalizedStartsAt = startsAt ? String(startsAt).trim() : null
+  const normalizedExpiresAt = expiresAt ? String(expiresAt).trim() : null
+
+  if (!normalizedCode) {
+    res.status(400).json({ ok: false, error: 'Código é obrigatório.' })
+    return
+  }
+
+  if (!Number.isFinite(normalizedRewardValue) || normalizedRewardValue <= 0) {
+    res.status(400).json({ ok: false, error: 'Valor de recompensa inválido.' })
+    return
+  }
+
+  if (!Number.isInteger(normalizedMaxTotalUses) || normalizedMaxTotalUses <= 0) {
+    res.status(400).json({ ok: false, error: 'Limite máximo de usos inválido.' })
+    return
+  }
+
+  try {
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS gift_codes (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        code VARCHAR(50) NOT NULL,
+        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        max_total_uses INT NOT NULL DEFAULT 1,
+        used_count INT NOT NULL DEFAULT 0,
+        notes VARCHAR(255) NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        starts_at DATETIME NULL,
+        expires_at DATETIME NULL,
+        created_by_user_id BIGINT UNSIGNED NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_gift_codes_code (code),
+        KEY idx_gift_codes_active (is_active),
+        KEY idx_gift_codes_expires (expires_at)
+      )
+      `
+    )
+
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS gift_code_redemptions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        gift_code_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        reward_type VARCHAR(50) NOT NULL DEFAULT 'balance_credit',
+        reward_value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        reward_applied TINYINT(1) NOT NULL DEFAULT 0,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_gift_code_redemption_once (gift_code_id, user_id),
+        KEY idx_gift_code_redemptions_user (user_id),
+        KEY idx_gift_code_redemptions_code (gift_code_id)
+      )
+      `
+    )
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO gift_codes
+      (
+        code,
+        reward_type,
+        reward_value,
+        max_total_uses,
+        used_count,
+        notes,
+        is_active,
+        starts_at,
+        expires_at,
+        created_by_user_id
+      )
+      VALUES (?, ?, ?, ?, 0, ?, 1, ?, ?, ?)
+      `,
+      [
+        normalizedCode,
+        normalizedRewardType,
+        Number(normalizedRewardValue.toFixed(2)),
+        normalizedMaxTotalUses,
+        normalizedNotes || null,
+        normalizedStartsAt || null,
+        normalizedExpiresAt || null,
+        Number(req.authUser?.id ?? 0) || null,
+      ]
+    ) as any
+
+    res.status(201).json({
+      ok: true,
+      message: `Código ${normalizedCode} criado com sucesso.`,
+      giftCode: {
+        id: Number(result?.insertId ?? 0),
+        code: normalizedCode,
+        rewardType: normalizedRewardType,
+        rewardValue: Number(normalizedRewardValue.toFixed(2)),
+        maxTotalUses: normalizedMaxTotalUses,
+        usedCount: 0,
+        notes: normalizedNotes,
+        startsAt: normalizedStartsAt,
+        expiresAt: normalizedExpiresAt,
+      },
+    })
+  } catch (err: any) {
+    if (String(err?.code ?? '') === 'ER_DUP_ENTRY') {
+      res.status(409).json({ ok: false, error: 'Este código já existe.' })
+      return
+    }
+
+    console.error('[admin-gift-codes-create]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao criar código de presente.' })
+  }
+})
+
 app.post('/api/gift-codes/redeem', async (req, res) => {
   const { userId, code } = req.body as { userId?: number; code?: string }
 
