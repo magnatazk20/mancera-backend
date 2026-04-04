@@ -3790,6 +3790,24 @@ const ensureGiftVoucherTables = async () => {
     )
     `
   )
+
+  const tryAlter = async (sql: string) => {
+    try {
+      await pool.query(sql)
+    } catch {
+      // já existe
+    }
+  }
+
+  await tryAlter(`
+    ALTER TABLE gift_voucher_purchases
+    ADD COLUMN generated_gift_code VARCHAR(50) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE gift_voucher_purchases
+    ADD COLUMN generated_gift_code_id BIGINT UNSIGNED NULL
+  `)
 }
 
 const ensureGiftCodeTables = async () => {
@@ -4035,6 +4053,7 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
   const conn = await pool.getConnection()
   try {
     await ensureGiftVoucherTables()
+    await ensureGiftCodeTables()
     await conn.beginTransaction()
 
     const [userRows] = await conn.query<RowDataPacket[]>(
@@ -4073,6 +4092,7 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
 
     const currentBalance = Number(userRows[0].balance ?? 0)
     const voucherPrice = Number(voucherRows[0].price ?? 0)
+    const redeemRewardValue = Number(voucherRows[0].redeemRewardValue ?? 0)
 
     if (currentBalance < voucherPrice) {
       await conn.rollback()
@@ -4096,6 +4116,52 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
       [balanceAfter, parsedUserId]
     )
 
+    let generatedGiftCode = ''
+    for (let i = 0; i < 6; i++) {
+      const candidate = `GV${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 900 + 100)}`
+      const [existsRows] = await conn.query<RowDataPacket[]>(
+        'SELECT id FROM gift_codes WHERE code = ? LIMIT 1',
+        [candidate]
+      )
+      if (existsRows.length === 0) {
+        generatedGiftCode = candidate
+        break
+      }
+    }
+
+    if (!generatedGiftCode) {
+      await conn.rollback()
+      res.status(500).json({ ok: false, error: 'Não foi possível gerar código de presente.' })
+      return
+    }
+
+    const [giftCodeResult] = await conn.query(
+      `
+      INSERT INTO gift_codes
+      (
+        code,
+        reward_type,
+        reward_value,
+        max_total_uses,
+        used_count,
+        notes,
+        is_active,
+        starts_at,
+        expires_at,
+        created_by_user_id
+      )
+      VALUES (?, 'balance_credit', ?, 1, 0, ?, 1, NOW(), NULL, ?)
+      `,
+      [
+        generatedGiftCode,
+        Number(redeemRewardValue.toFixed(2)),
+        `Gerado pela compra do vale #${parsedGiftVoucherId}`,
+        parsedUserId,
+      ]
+    ) as any
+
+    const generatedGiftCodeId = Number(giftCodeResult?.insertId ?? 0)
+
     const [purchaseResult] = await conn.query(
       `
       INSERT INTO gift_voucher_purchases
@@ -4105,16 +4171,20 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
         paid_amount,
         discount_coupon,
         redeem_reward_value,
+        generated_gift_code,
+        generated_gift_code_id,
         status
       )
-      VALUES (?, ?, ?, ?, ?, 'paid')
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'paid')
       `,
       [
         parsedUserId,
         parsedGiftVoucherId,
         Number(voucherPrice.toFixed(2)),
         String(voucherRows[0].discountCoupon ?? ''),
-        Number(voucherRows[0].redeemRewardValue ?? 0),
+        Number(redeemRewardValue.toFixed(2)),
+        generatedGiftCode,
+        generatedGiftCodeId || null,
       ]
     ) as any
 
@@ -4123,13 +4193,14 @@ app.post('/api/gift-vouchers/purchase', requireAuth, async (req: AuthenticatedRe
     res.json({
       ok: true,
       message: 'Vale presente comprado com sucesso.',
+      generatedGiftCode,
       purchase: {
         id: Number(purchaseResult?.insertId ?? 0),
         giftVoucherId: parsedGiftVoucherId,
         name: String(voucherRows[0].name ?? ''),
         paidAmount: Number(voucherPrice.toFixed(2)),
-        discountCoupon: String(voucherRows[0].discountCoupon ?? ''),
-        redeemRewardValue: Number(voucherRows[0].redeemRewardValue ?? 0),
+        redeemRewardValue: Number(redeemRewardValue.toFixed(2)),
+        generatedGiftCode,
       },
       balanceBefore: Number(currentBalance.toFixed(2)),
       balanceAfter,
