@@ -1898,6 +1898,7 @@ app.get('/api/community-links', async (_req, res) => {
       CREATE TABLE IF NOT EXISTS community_links (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         whatsapp_group_url VARCHAR(500) NOT NULL,
+        vip_group_url VARCHAR(500) NOT NULL DEFAULT '',
         manager_contact VARCHAR(255) NOT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1911,11 +1912,12 @@ app.get('/api/community-links', async (_req, res) => {
       SELECT
         id,
         whatsapp_group_url AS whatsappGroupUrl,
+        vip_group_url AS vipGroupUrl,
         manager_contact AS managerContact,
         created_at AS createdAt,
         updated_at AS updatedAt
       FROM community_links
-      ORDER BY id ASC
+      ORDER BY id DESC
       LIMIT 1
       `
     )
@@ -1925,6 +1927,7 @@ app.get('/api/community-links', async (_req, res) => {
         ok: true,
         links: {
           whatsappGroupUrl: '',
+          vipGroupUrl: '',
           managerContact: '',
         },
       })
@@ -1936,6 +1939,7 @@ app.get('/api/community-links', async (_req, res) => {
       links: {
         id: Number(rows[0].id),
         whatsappGroupUrl: String(rows[0].whatsappGroupUrl ?? ''),
+        vipGroupUrl: String(rows[0].vipGroupUrl ?? ''),
         managerContact: String(rows[0].managerContact ?? ''),
         createdAt: rows[0].createdAt,
         updatedAt: rows[0].updatedAt,
@@ -1948,12 +1952,14 @@ app.get('/api/community-links', async (_req, res) => {
 })
 
 app.post('/api/community-links', async (req, res) => {
-  const { whatsappGroupUrl, managerContact } = req.body as {
+  const { whatsappGroupUrl, vipGroupUrl, managerContact } = req.body as {
     whatsappGroupUrl?: string
+    vipGroupUrl?: string
     managerContact?: string
   }
 
   const parsedWhatsappGroupUrl = String(whatsappGroupUrl ?? '').trim()
+  const parsedVipGroupUrl = String(vipGroupUrl ?? '').trim()
   const parsedManagerContact = String(managerContact ?? '').trim()
 
   if (!parsedWhatsappGroupUrl) {
@@ -1972,6 +1978,7 @@ app.post('/api/community-links', async (req, res) => {
       CREATE TABLE IF NOT EXISTS community_links (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         whatsapp_group_url VARCHAR(500) NOT NULL,
+        vip_group_url VARCHAR(500) NOT NULL DEFAULT '',
         manager_contact VARCHAR(255) NOT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1987,10 +1994,10 @@ app.post('/api/community-links', async (req, res) => {
     if (rows.length === 0) {
       await pool.query(
         `
-        INSERT INTO community_links (whatsapp_group_url, manager_contact)
-        VALUES (?, ?)
+        INSERT INTO community_links (whatsapp_group_url, vip_group_url, manager_contact)
+        VALUES (?, ?, ?)
         `,
-        [parsedWhatsappGroupUrl, parsedManagerContact]
+        [parsedWhatsappGroupUrl, parsedVipGroupUrl, parsedManagerContact]
       )
     } else {
       await pool.query(
@@ -1998,11 +2005,12 @@ app.post('/api/community-links', async (req, res) => {
         UPDATE community_links
         SET
           whatsapp_group_url = ?,
+          vip_group_url = ?,
           manager_contact = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [parsedWhatsappGroupUrl, parsedManagerContact, Number(rows[0].id)]
+        [parsedWhatsappGroupUrl, parsedVipGroupUrl, parsedManagerContact, Number(rows[0].id)]
       )
     }
 
@@ -2011,6 +2019,7 @@ app.post('/api/community-links', async (req, res) => {
       message: 'Links da comunidade salvos com sucesso.',
       links: {
         whatsappGroupUrl: parsedWhatsappGroupUrl,
+        vipGroupUrl: parsedVipGroupUrl,
         managerContact: parsedManagerContact,
       },
     })
