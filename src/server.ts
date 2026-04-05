@@ -4812,6 +4812,22 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
       `
     )
 
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_deposit_quick_presets (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        preset_order INT NOT NULL DEFAULT 0,
+        value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_system_deposit_quick_presets_order (preset_order),
+        KEY idx_system_deposit_quick_presets_active (is_active)
+      )
+      `
+    )
+
     try {
       await pool.query(
         `
@@ -4831,13 +4847,53 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
       `
     )
 
+    const [legacyConfigRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT quick_preset_values AS quickPresetValues
+      FROM system_deposit_config
+      ORDER BY id ASC
+      LIMIT 1
+      `
+    )
+
+    const [presetCountRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COUNT(*) AS total
+      FROM system_deposit_quick_presets
+      WHERE is_active = 1
+      `
+    )
+
+    const activePresetCount = Number(presetCountRows[0]?.total ?? 0)
+    if (activePresetCount === 0) {
+      const legacyValuesRaw = String(legacyConfigRows[0]?.quickPresetValues ?? '20,50,100,200,500')
+      const values = legacyValuesRaw
+        .split(',')
+        .map((item) => Number(String(item).trim().replace(',', '.')))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .map((value) => Number(value.toFixed(2)))
+
+      const presetsToInsert = values.length > 0 ? values : [20, 50, 100, 200, 500]
+
+      await pool.query('DELETE FROM system_deposit_quick_presets')
+      for (let i = 0; i < presetsToInsert.length; i += 1) {
+        await pool.query(
+          `
+          INSERT INTO system_deposit_quick_presets
+            (preset_order, value, is_active)
+          VALUES (?, ?, 1)
+          `,
+          [i + 1, Number(presetsToInsert[i].toFixed(2))]
+        )
+      }
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
         min_deposit_amount AS minDepositAmount,
         max_deposit_amount AS maxDepositAmount,
-        deposit_enabled AS depositEnabled,
-        quick_preset_values AS quickPresetValues
+        deposit_enabled AS depositEnabled
       FROM system_deposit_config
       ORDER BY id ASC
       LIMIT 1
@@ -4853,25 +4909,47 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
         `
       )
 
+      const [presetRowsOnEmpty] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT value
+        FROM system_deposit_quick_presets
+        WHERE is_active = 1
+        ORDER BY preset_order ASC, id ASC
+        `
+      )
+
+      const presetValuesOnEmpty = presetRowsOnEmpty
+        .map((row) => Number(row.value ?? 0))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .map((value) => Number(value.toFixed(2)))
+
       res.json({
         ok: true,
         config: {
           minDepositAmount: 0,
           maxDepositAmount: 0,
           depositEnabled: true,
-          quickPresetValues: [20, 50, 100, 200, 500],
+          quickPresetValues: presetValuesOnEmpty.length > 0 ? presetValuesOnEmpty : [20, 50, 100, 200, 500],
         },
       })
       return
     }
 
-    const row = rows[0]
-    const quickPresetValuesRaw = String(row.quickPresetValues ?? '')
-    const quickPresetValues = quickPresetValuesRaw
-      .split(',')
-      .map((item) => Number(String(item).trim().replace(',', '.')))
+    const [presetRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT value
+      FROM system_deposit_quick_presets
+      WHERE is_active = 1
+      ORDER BY preset_order ASC, id ASC
+      `
+    )
+
+    const quickPresetValues = presetRows
+      .map((row) => Number(row.value ?? 0))
       .filter((value) => Number.isFinite(value) && value > 0)
       .map((value) => Number(value.toFixed(2)))
+
+    const row = rows[0]
 
     res.json({
       ok: true,
@@ -4953,6 +5031,22 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
       `
     )
 
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_deposit_quick_presets (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        preset_order INT NOT NULL DEFAULT 0,
+        value DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_system_deposit_quick_presets_order (preset_order),
+        KEY idx_system_deposit_quick_presets_active (is_active)
+      )
+      `
+    )
+
     try {
       await pool.query(
         `
@@ -4963,14 +5057,6 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
     } catch {
       // coluna já existe
     }
-
-    await pool.query(
-      `
-      UPDATE system_deposit_config
-      SET quick_preset_values = '20,50,100,200,500'
-      WHERE quick_preset_values IS NULL OR TRIM(quick_preset_values) = ''
-      `
-    )
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_deposit_config ORDER BY id ASC LIMIT 1'
@@ -5003,6 +5089,18 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
         WHERE id = ?
         `,
         [normalizedMin, normalizedMax, enabled, quickPresetValuesString, Number(rows[0].id)]
+      )
+    }
+
+    await pool.query('DELETE FROM system_deposit_quick_presets')
+    for (let i = 0; i < normalizedQuickPresetValues.length; i += 1) {
+      await pool.query(
+        `
+        INSERT INTO system_deposit_quick_presets
+          (preset_order, value, is_active)
+        VALUES (?, ?, 1)
+        `,
+        [i + 1, Number(normalizedQuickPresetValues[i].toFixed(2))]
       )
     }
 
