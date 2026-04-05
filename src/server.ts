@@ -5472,6 +5472,15 @@ app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => 
     }
 
     // cancel
+    if (!isCurrentlyPaid) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: 'Apenas depósitos aprovados/pagos podem ser cancelados com débito em conta.',
+      })
+      return
+    }
+
     await conn.query(
       `
       UPDATE cashin_payments
@@ -5481,33 +5490,38 @@ app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => 
       [depositId]
     )
 
-    if (isCurrentlyPaid) {
-      const nextBalance = Math.max(Number((currentBalance - amount).toFixed(2)), 0)
-      const nextTotalDeposits = Math.max(Number((currentTotalDeposits - amount).toFixed(2)), 0)
+    const nextBalance = Number((currentBalance - amount).toFixed(2))
+    const nextTotalDeposits = Number((currentTotalDeposits - amount).toFixed(2))
 
-      await conn.query(
-        `
-        UPDATE users
-        SET
-          balance = ?,
-          total_deposits = ?
-        WHERE id = ?
-        `,
-        [nextBalance, nextTotalDeposits, userId]
-      )
+    if (nextBalance < 0 || nextTotalDeposits < 0) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: 'Não foi possível cancelar: saldo/depósitos do usuário insuficientes para débito.',
+      })
+      return
     }
+
+    await conn.query(
+      `
+      UPDATE users
+      SET
+        balance = ?,
+        total_deposits = ?
+      WHERE id = ?
+      `,
+      [nextBalance, nextTotalDeposits, userId]
+    )
 
     await conn.commit()
     res.json({
       ok: true,
-      message: isCurrentlyPaid
-        ? 'Depósito cancelado e valor removido da conta do usuário.'
-        : 'Depósito cancelado com sucesso.',
+      message: 'Depósito cancelado e valor removido da conta do usuário.',
       deposit: {
         id: depositId,
         status: 'failed',
       },
-      debitedFromUser: isCurrentlyPaid,
+      debitedFromUser: true,
     })
   } catch (err) {
     await conn.rollback()
