@@ -5307,9 +5307,13 @@ app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
         cp.created_at AS createdAt,
         cp.paid_at AS paidAt,
         u.name AS userName,
-        u.phone AS userPhone
+        u.phone AS userPhone,
+        ref.id AS referrerId,
+        ref.name AS referrerName,
+        ref.phone AS referrerPhone
       FROM cashin_payments cp
       INNER JOIN users u ON u.id = cp.user_id
+      LEFT JOIN users ref ON ref.id = u.referred_by_user_id
       WHERE 1 = 1
         ${statusSql}
         ${
@@ -5352,6 +5356,13 @@ app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
         name: String(row.userName ?? 'Usuário'),
         phone: String(row.userPhone ?? ''),
       },
+      referrer: row.referrerId == null
+        ? null
+        : {
+            id: Number(row.referrerId),
+            name: String(row.referrerName ?? 'Usuário'),
+            phone: String(row.referrerPhone ?? ''),
+          },
     }))
 
     res.json({
