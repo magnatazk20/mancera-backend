@@ -3116,10 +3116,6 @@ const ensureGiftCodeTables = async () => {
     ALTER TABLE gift_codes
     ADD COLUMN discount_percent DECIMAL(8,2) NULL
   `);
-    await tryAlter(`
-    ALTER TABLE gift_code_redemptions
-    MODIFY COLUMN metadata JSON NULL
-  `);
 };
 app.get('/api/gift-vouchers', requireAuth, async (_req, res) => {
     try {
@@ -4181,6 +4177,89 @@ app.get('/api/admin/overview', requireMaxAdmin, async (_req, res) => {
     catch (err) {
         console.error('[admin-overview]', err);
         res.status(500).json({ ok: false, error: 'Erro ao carregar visão geral do admin.' });
+    }
+});
+app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
+    const statusFilter = String(req.query.status ?? 'all').trim().toLowerCase();
+    const search = String(req.query.search ?? '').trim();
+    const rawLimit = Number(req.query.limit ?? 100);
+    const limit = Math.min(Math.max(rawLimit, 1), 500);
+    const statusSql = statusFilter === 'paid'
+        ? `AND LOWER(cp.status) IN ('paid', 'payment.paid')`
+        : statusFilter === 'pending'
+            ? `AND LOWER(cp.status) = 'pending'`
+            : statusFilter === 'processing'
+                ? `AND LOWER(cp.status) = 'processing'`
+                : statusFilter === 'failed'
+                    ? `AND LOWER(cp.status) IN ('failed', 'canceled', 'cancelled')`
+                    : '';
+    try {
+        const [rows] = await db_1.default.query(`
+      SELECT
+        cp.id,
+        cp.user_id AS userId,
+        cp.amount,
+        cp.method,
+        cp.status,
+        cp.provider_transaction_id AS providerTransactionId,
+        cp.created_at AS createdAt,
+        cp.paid_at AS paidAt,
+        u.name AS userName,
+        u.phone AS userPhone
+      FROM cashin_payments cp
+      INNER JOIN users u ON u.id = cp.user_id
+      WHERE 1 = 1
+        ${statusSql}
+        ${search
+            ? `AND (
+                 CAST(cp.id AS CHAR) LIKE ?
+                 OR CAST(cp.user_id AS CHAR) LIKE ?
+                 OR COALESCE(cp.provider_transaction_id, '') LIKE ?
+                 OR COALESCE(u.name, '') LIKE ?
+                 OR COALESCE(u.phone, '') LIKE ?
+               )`
+            : ''}
+      ORDER BY cp.id DESC
+      LIMIT ?
+      `, search
+            ? [
+                `%${search}%`,
+                `%${search}%`,
+                `%${search}%`,
+                `%${search}%`,
+                `%${search}%`,
+                limit,
+            ]
+            : [limit]);
+        const deposits = rows.map((row) => ({
+            id: Number(row.id),
+            userId: Number(row.userId),
+            amount: Number(row.amount ?? 0),
+            method: String(row.method ?? 'pix'),
+            status: String(row.status ?? 'pending').toLowerCase(),
+            providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
+            createdAt: row.createdAt ?? null,
+            paidAt: row.paidAt ?? null,
+            user: {
+                id: Number(row.userId),
+                name: String(row.userName ?? 'Usuário'),
+                phone: String(row.userPhone ?? ''),
+            },
+        }));
+        res.json({
+            ok: true,
+            filter: {
+                status: statusFilter,
+                search: search || null,
+                limit,
+            },
+            total: deposits.length,
+            deposits,
+        });
+    }
+    catch (err) {
+        console.error('[admin-deposits-list]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar entradas de pagamentos.' });
     }
 });
 app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
