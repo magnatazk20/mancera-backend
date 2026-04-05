@@ -4804,6 +4804,7 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
         min_deposit_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_deposit_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         deposit_enabled TINYINT(1) NOT NULL DEFAULT 1,
+        quick_preset_values VARCHAR(255) NOT NULL DEFAULT '20,50,100,200,500',
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -4811,12 +4812,24 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
       `
     )
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_deposit_config
+        ADD COLUMN quick_preset_values VARCHAR(255) NOT NULL DEFAULT '20,50,100,200,500'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
         min_deposit_amount AS minDepositAmount,
         max_deposit_amount AS maxDepositAmount,
-        deposit_enabled AS depositEnabled
+        deposit_enabled AS depositEnabled,
+        quick_preset_values AS quickPresetValues
       FROM system_deposit_config
       ORDER BY id ASC
       LIMIT 1
@@ -4827,8 +4840,8 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
       await pool.query(
         `
         INSERT INTO system_deposit_config
-          (min_deposit_amount, max_deposit_amount, deposit_enabled)
-        VALUES (0.00, 0.00, 1)
+          (min_deposit_amount, max_deposit_amount, deposit_enabled, quick_preset_values)
+        VALUES (0.00, 0.00, 1, '20,50,100,200,500')
         `
       )
 
@@ -4838,18 +4851,27 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
           minDepositAmount: 0,
           maxDepositAmount: 0,
           depositEnabled: true,
+          quickPresetValues: [20, 50, 100, 200, 500],
         },
       })
       return
     }
 
     const row = rows[0]
+    const quickPresetValuesRaw = String(row.quickPresetValues ?? '')
+    const quickPresetValues = quickPresetValuesRaw
+      .split(',')
+      .map((item) => Number(String(item).trim().replace(',', '.')))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Number(value.toFixed(2)))
+
     res.json({
       ok: true,
       config: {
         minDepositAmount: Number(row.minDepositAmount ?? 0),
         maxDepositAmount: Number(row.maxDepositAmount ?? 0),
         depositEnabled: Number(row.depositEnabled ?? 1) === 1,
+        quickPresetValues: quickPresetValues.length > 0 ? quickPresetValues : [20, 50, 100, 200, 500],
       },
     })
   } catch (err) {
@@ -4859,10 +4881,11 @@ app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
-  const { minDepositAmount, maxDepositAmount, depositEnabled } = req.body as {
+  const { minDepositAmount, maxDepositAmount, depositEnabled, quickPresetValues } = req.body as {
     minDepositAmount?: number | string
     maxDepositAmount?: number | string
     depositEnabled?: boolean | number | string
+    quickPresetValues?: Array<number | string> | string
   }
 
   const min = Number(String(minDepositAmount ?? 0).replace(',', '.'))
@@ -4889,6 +4912,23 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
     return
   }
 
+  const parsedQuickPresetValues = Array.isArray(quickPresetValues)
+    ? quickPresetValues
+    : String(quickPresetValues ?? '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean)
+
+  const normalizedQuickPresetValues = parsedQuickPresetValues
+    .map((item) => Number(String(item).replace(',', '.')))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => Number(value.toFixed(2)))
+
+  if (normalizedQuickPresetValues.length === 0) {
+    res.status(400).json({ ok: false, error: 'Informe ao menos um valor pré-selecionado válido.' })
+    return
+  }
+
   try {
     await pool.query(
       `
@@ -4897,12 +4937,24 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
         min_deposit_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_deposit_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         deposit_enabled TINYINT(1) NOT NULL DEFAULT 1,
+        quick_preset_values VARCHAR(255) NOT NULL DEFAULT '20,50,100,200,500',
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
       )
       `
     )
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_deposit_config
+        ADD COLUMN quick_preset_values VARCHAR(255) NOT NULL DEFAULT '20,50,100,200,500'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
 
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_deposit_config ORDER BY id ASC LIMIT 1'
@@ -4911,14 +4963,16 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
     const normalizedMin = Number(min.toFixed(2))
     const normalizedMax = Number(max.toFixed(2))
 
+    const quickPresetValuesString = normalizedQuickPresetValues.join(',')
+
     if (rows.length === 0) {
       await pool.query(
         `
         INSERT INTO system_deposit_config
-          (min_deposit_amount, max_deposit_amount, deposit_enabled)
-        VALUES (?, ?, ?)
+          (min_deposit_amount, max_deposit_amount, deposit_enabled, quick_preset_values)
+        VALUES (?, ?, ?, ?)
         `,
-        [normalizedMin, normalizedMax, enabled]
+        [normalizedMin, normalizedMax, enabled, quickPresetValuesString]
       )
     } else {
       await pool.query(
@@ -4928,10 +4982,11 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
           min_deposit_amount = ?,
           max_deposit_amount = ?,
           deposit_enabled = ?,
+          quick_preset_values = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [normalizedMin, normalizedMax, enabled, Number(rows[0].id)]
+        [normalizedMin, normalizedMax, enabled, quickPresetValuesString, Number(rows[0].id)]
       )
     }
 
@@ -4942,6 +4997,7 @@ app.post('/api/admin/deposit-config', requireMaxAdmin, async (req, res) => {
         minDepositAmount: normalizedMin,
         maxDepositAmount: normalizedMax,
         depositEnabled: enabled === 1,
+        quickPresetValues: normalizedQuickPresetValues,
       },
     })
   } catch (err) {
