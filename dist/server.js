@@ -4205,9 +4205,23 @@ app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
         cp.created_at AS createdAt,
         cp.paid_at AS paidAt,
         u.name AS userName,
-        u.phone AS userPhone
+        u.phone AS userPhone,
+        ref.id AS referrerId,
+        ref.name AS referrerName,
+        ref.phone AS referrerPhone,
+        (
+          SELECT COUNT(*)
+          FROM users child
+          WHERE child.referred_by_user_id = u.id
+        ) AS referredCount,
+        (
+          SELECT GROUP_CONCAT(CONCAT(COALESCE(child.name, 'Usuário'), '::', COALESCE(child.phone, '')) SEPARATOR '||')
+          FROM users child
+          WHERE child.referred_by_user_id = u.id
+        ) AS referredUsersRaw
       FROM cashin_payments cp
       INNER JOIN users u ON u.id = cp.user_id
+      LEFT JOIN users ref ON ref.id = u.referred_by_user_id
       WHERE 1 = 1
         ${statusSql}
         ${search
@@ -4231,21 +4245,46 @@ app.get('/api/admin/deposits', requireMaxAdmin, async (req, res) => {
                 limit,
             ]
             : [limit]);
-        const deposits = rows.map((row) => ({
-            id: Number(row.id),
-            userId: Number(row.userId),
-            amount: Number(row.amount ?? 0),
-            method: String(row.method ?? 'pix'),
-            status: String(row.status ?? 'pending').toLowerCase(),
-            providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
-            createdAt: row.createdAt ?? null,
-            paidAt: row.paidAt ?? null,
-            user: {
-                id: Number(row.userId),
-                name: String(row.userName ?? 'Usuário'),
-                phone: String(row.userPhone ?? ''),
-            },
-        }));
+        const deposits = rows.map((row) => {
+            const referredUsersRaw = String(row.referredUsersRaw ?? '').trim();
+            const referredUsers = referredUsersRaw
+                ? referredUsersRaw
+                    .split('||')
+                    .map((entry) => {
+                    const [nameRaw, phoneRaw] = String(entry).split('::');
+                    return {
+                        name: String(nameRaw ?? 'Usuário'),
+                        phone: String(phoneRaw ?? ''),
+                    };
+                })
+                : [];
+            return {
+                id: Number(row.id),
+                userId: Number(row.userId),
+                amount: Number(row.amount ?? 0),
+                method: String(row.method ?? 'pix'),
+                status: String(row.status ?? 'pending').toLowerCase(),
+                providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
+                createdAt: row.createdAt ?? null,
+                paidAt: row.paidAt ?? null,
+                user: {
+                    id: Number(row.userId),
+                    name: String(row.userName ?? 'Usuário'),
+                    phone: String(row.userPhone ?? ''),
+                },
+                referrer: row.referrerId == null
+                    ? null
+                    : {
+                        id: Number(row.referrerId),
+                        name: String(row.referrerName ?? 'Usuário'),
+                        phone: String(row.referrerPhone ?? ''),
+                    },
+                referred: {
+                    count: Number(row.referredCount ?? 0),
+                    users: referredUsers,
+                },
+            };
+        });
         res.json({
             ok: true,
             filter: {
