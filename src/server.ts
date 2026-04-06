@@ -603,6 +603,14 @@ const processTelegramUpdates = async () => {
             connected_at
           )
           VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
+          ON DUPLICATE KEY UPDATE
+            phone = VALUES(phone),
+            telegram_chat_id = VALUES(telegram_chat_id),
+            telegram_user_id = VALUES(telegram_user_id),
+            telegram_username = VALUES(telegram_username),
+            telegram_first_name = VALUES(telegram_first_name),
+            is_connected = 1,
+            updated_at = NOW()
           `,
           [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]
         )
