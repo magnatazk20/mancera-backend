@@ -222,13 +222,6 @@ const sendTelegramMessage = async (botToken: string, chatId: string, text: strin
   }
 }
 
-const getDefaultTelegramWelcomeMessage = () =>
-  [
-    'Bem-vindo ao bot oficial.',
-    'Envie /start para iniciar a conexão.',
-    'Depois envie APENAS o telefone cadastrado na plataforma (ex.: 11999998888).',
-  ].join('\n')
-
 const processTelegramUpdates = async () => {
   try {
     await ensureTelegramConfigTable()
@@ -248,8 +241,7 @@ const processTelegramUpdates = async () => {
 
     const botToken = String(configRows[0].botToken ?? '').trim()
     const configuredGroupId = String(configRows[0].groupId ?? '').trim()
-    const configuredWelcomeMessage = String(configRows[0].welcomeMessage ?? '').trim()
-    const welcomeMessage = configuredWelcomeMessage || getDefaultTelegramWelcomeMessage()
+    const welcomeMessage = String(configRows[0].welcomeMessage ?? '').trim()
     if (!botToken) return
 
     const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`
@@ -306,7 +298,15 @@ const processTelegramUpdates = async () => {
         textLower === '/start' || textLower.startsWith('/start@')
 
       if (isStartCommand) {
-        await sendTelegramMessage(botToken, chatId, welcomeMessage)
+        if (welcomeMessage) {
+          await sendTelegramMessage(botToken, chatId, welcomeMessage)
+        } else {
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            'Mensagem de boas-vindas não configurada. Peça ao administrador para configurar em /adf/telegram-config.'
+          )
+        }
         continue
       }
 
@@ -6161,7 +6161,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         config: {
           botToken: '',
           groupId: '',
-          welcomeMessage: getDefaultTelegramWelcomeMessage(),
+          welcomeMessage: '',
           updatedAt: null,
         },
       })
@@ -6173,7 +6173,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
       config: {
         botToken: String(rows[0].botToken ?? ''),
         groupId: String(rows[0].groupId ?? ''),
-        welcomeMessage: String(rows[0].welcomeMessage ?? '') || getDefaultTelegramWelcomeMessage(),
+        welcomeMessage: String(rows[0].welcomeMessage ?? ''),
         updatedAt: rows[0].updatedAt ?? null,
       },
     })
@@ -6192,8 +6192,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
 
   const parsedBotToken = String(botToken ?? '').trim()
   const parsedGroupId = String(groupId ?? '').trim()
-  const parsedWelcomeMessageRaw = String(welcomeMessage ?? '').trim()
-  const parsedWelcomeMessage = parsedWelcomeMessageRaw || getDefaultTelegramWelcomeMessage()
+  const parsedWelcomeMessage = String(welcomeMessage ?? '').trim()
 
   if (!parsedBotToken) {
     res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' })
