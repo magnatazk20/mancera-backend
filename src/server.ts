@@ -474,15 +474,12 @@ const processTelegramUpdates = async () => {
       )
 
       if (existingByUserRows.length > 0) {
-        const existingChatId = String(existingByUserRows[0].telegramChatId ?? '').trim()
-        if (existingChatId && existingChatId !== chatId) {
-          await sendTelegramMessage(
-            botToken,
-            chatId,
-            'Esta conta já está conectada em outro Telegram e não pode ser vinculada novamente.'
-          )
-          continue
-        }
+        await sendTelegramMessage(
+          botToken,
+          chatId,
+          'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
+        )
+        continue
       }
 
       await pool.query(
