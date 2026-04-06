@@ -168,13 +168,52 @@ const ensureTelegramConfigTable = async () => {
     `
     CREATE TABLE IF NOT EXISTS system_telegram_config (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      singleton_key TINYINT UNSIGNED NOT NULL DEFAULT 1,
       bot_token VARCHAR(255) NOT NULL DEFAULT '',
       group_id VARCHAR(255) NOT NULL DEFAULT '',
       welcome_message TEXT NULL,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id)
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_system_telegram_config_singleton (singleton_key)
     )
+    `
+  )
+
+  try {
+    await pool.query(
+      `
+      ALTER TABLE system_telegram_config
+      ADD COLUMN singleton_key TINYINT UNSIGNED NOT NULL DEFAULT 1
+      `
+    )
+  } catch {
+    // coluna já existe
+  }
+
+  try {
+    await pool.query(
+      `
+      ALTER TABLE system_telegram_config
+      ADD UNIQUE KEY uq_system_telegram_config_singleton (singleton_key)
+      `
+    )
+  } catch {
+    // índice já existe
+  }
+
+  await pool.query(
+    `
+    UPDATE system_telegram_config
+    SET singleton_key = 1
+    WHERE singleton_key IS NULL OR singleton_key <> 1
+    `
+  )
+
+  await pool.query(
+    `
+    INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message)
+    VALUES (1, '', '', '')
     `
   )
 }
@@ -6207,32 +6246,18 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
   try {
     await ensureTelegramConfigTable()
 
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM system_telegram_config ORDER BY id ASC LIMIT 1'
+    await pool.query(
+      `
+      INSERT INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message)
+      VALUES (1, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        bot_token = VALUES(bot_token),
+        group_id = VALUES(group_id),
+        welcome_message = VALUES(welcome_message),
+        updated_at = NOW()
+      `,
+      [parsedBotToken, parsedGroupId, parsedWelcomeMessage]
     )
-
-    if (rows.length === 0) {
-      await pool.query(
-        `
-        INSERT INTO system_telegram_config (bot_token, group_id, welcome_message)
-        VALUES (?, ?, ?)
-        `,
-        [parsedBotToken, parsedGroupId, parsedWelcomeMessage]
-      )
-    } else {
-      await pool.query(
-        `
-        UPDATE system_telegram_config
-        SET
-          bot_token = ?,
-          group_id = ?,
-          welcome_message = ?,
-          updated_at = NOW()
-        WHERE id = ?
-        `,
-        [parsedBotToken, parsedGroupId, parsedWelcomeMessage, Number(rows[0].id)]
-      )
-    }
 
     res.json({
       ok: true,
