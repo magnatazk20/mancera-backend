@@ -326,6 +326,21 @@ const ensureTelegramConnectedColumn = async () => {
   }
 }
 
+const ensureTelegramConnectedSync = async () => {
+  try {
+    await pool.query(
+      `
+      UPDATE users u
+      INNER JOIN user_telegram_connections utc ON utc.user_id = u.id
+      SET u.telegram_conectado = 1
+      WHERE COALESCE(utc.is_connected, 1) = 1
+      `
+    )
+  } catch (err) {
+    console.error('[ensure-telegram-connected-sync]', err)
+  }
+}
+
 const normalizePhoneForCompare = (value: string) => String(value ?? '').replace(/\D/g, '')
 
 const sendTelegramMessage = async (botToken: string, chatId: string, text: string) => {
@@ -351,6 +366,7 @@ const processTelegramUpdates = async () => {
     await ensureTelegramConfigTable()
     await ensureUserTelegramConnectionsTable()
     await ensureTelegramConnectedColumn()
+    await ensureTelegramConnectedSync()
 
     const [configRows] = await pool.query<RowDataPacket[]>(
       `
@@ -723,6 +739,7 @@ const bootstrapDatabase = async () => {
   await ensureTelegramConfigTable()
   await ensureUserTelegramConnectionsTable()
   await ensureTelegramConnectedColumn()
+  await ensureTelegramConnectedSync()
   console.log('[bootstrap-database] telegram config e conexões garantidas')
 }
 
