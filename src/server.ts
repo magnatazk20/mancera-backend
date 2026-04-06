@@ -506,50 +506,88 @@ const processTelegramUpdates = async () => {
         continue
       }
 
-      await pool.query(
-        `
-        INSERT INTO user_telegram_connections
-        (
-          user_id,
-          phone,
-          telegram_chat_id,
-          telegram_user_id,
-          telegram_username,
-          telegram_first_name,
-          is_connected,
-          connected_at
+      const conn = await pool.getConnection()
+      try {
+        await conn.beginTransaction()
+
+        await conn.query(
+          `
+          INSERT INTO user_telegram_connections
+          (
+            user_id,
+            phone,
+            telegram_chat_id,
+            telegram_user_id,
+            telegram_username,
+            telegram_first_name,
+            is_connected,
+            connected_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
+          ON DUPLICATE KEY UPDATE
+            telegram_chat_id = VALUES(telegram_chat_id),
+            telegram_user_id = VALUES(telegram_user_id),
+            telegram_username = VALUES(telegram_username),
+            telegram_first_name = VALUES(telegram_first_name),
+            is_connected = 1,
+            updated_at = NOW()
+          `,
+          [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]
         )
-        VALUES (?, ?, ?, ?, ?, ?, 1, NOW())`,
-        [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]
-      )
 
-      await pool.query(
-        `
-        UPDATE users
-        SET telegram_conectado = 1
-        WHERE id = ?
-        `,
-        [userId]
-      )
+        const [updateUserResult] = await conn.query(
+          `
+          UPDATE users
+          SET telegram_conectado = 1
+          WHERE id = ?
+          `,
+          [userId]
+        ) as any
 
-      const [confirmTelegramFlagRows] = await pool.query<RowDataPacket[]>(
-        `
-        SELECT telegram_conectado AS telegramConectado
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-        `,
-        [userId]
-      )
+        const affectedRows = Number(updateUserResult?.affectedRows ?? 0)
+        if (affectedRows <= 0) {
+          await conn.rollback()
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.'
+          )
+          continue
+        }
 
-      const telegramFlagPersisted = Number(confirmTelegramFlagRows[0]?.telegramConectado ?? 0) === 1
-      if (!telegramFlagPersisted) {
+        const [confirmTelegramFlagRows] = await conn.query<RowDataPacket[]>(
+          `
+          SELECT telegram_conectado AS telegramConectado
+          FROM users
+          WHERE id = ?
+          LIMIT 1
+          `,
+          [userId]
+        )
+
+        const telegramFlagPersisted = Number(confirmTelegramFlagRows[0]?.telegramConectado ?? 0) === 1
+        if (!telegramFlagPersisted) {
+          await conn.rollback()
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.'
+          )
+          continue
+        }
+
+        await conn.commit()
+      } catch (txErr) {
+        await conn.rollback()
+        console.error('[telegram-link-transaction]', txErr)
         await sendTelegramMessage(
           botToken,
           chatId,
           'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.'
         )
         continue
+      } finally {
+        conn.release()
       }
 
       io.to(`user:${userId}`).emit('telegram:connected', {
