@@ -313,6 +313,19 @@ const ensureUserTelegramConnectionsTable = async () => {
   )
 }
 
+const ensureTelegramConnectedColumn = async () => {
+  try {
+    await pool.query(
+      `
+      ALTER TABLE users
+      ADD COLUMN telegram_conectado TINYINT(1) NOT NULL DEFAULT 0
+      `
+    )
+  } catch {
+    // coluna já existe
+  }
+}
+
 const normalizePhoneForCompare = (value: string) => String(value ?? '').replace(/\D/g, '')
 
 const sendTelegramMessage = async (botToken: string, chatId: string, text: string) => {
@@ -337,6 +350,7 @@ const processTelegramUpdates = async () => {
   try {
     await ensureTelegramConfigTable()
     await ensureUserTelegramConnectionsTable()
+    await ensureTelegramConnectedColumn()
 
     const [configRows] = await pool.query<RowDataPacket[]>(
       `
@@ -443,7 +457,7 @@ const processTelegramUpdates = async () => {
 
       const [userRows] = await pool.query<RowDataPacket[]>(
         `
-        SELECT id, phone
+        SELECT id, phone, telegram_conectado AS telegramConectado
         FROM users
         WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
         LIMIT 1
@@ -462,6 +476,16 @@ const processTelegramUpdates = async () => {
 
       const userId = Number(userRows[0].id)
       const phone = String(userRows[0].phone ?? '')
+      const telegramConectado = Number(userRows[0].telegramConectado ?? 0)
+
+      if (telegramConectado === 1) {
+        await sendTelegramMessage(
+          botToken,
+          chatId,
+          'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
+        )
+        continue
+      }
 
       const [existingByUserRows] = await pool.query<RowDataPacket[]>(
         `
@@ -497,6 +521,15 @@ const processTelegramUpdates = async () => {
         )
         VALUES (?, ?, ?, ?, ?, ?, 1, NOW())`,
         [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]
+      )
+
+      await pool.query(
+        `
+        UPDATE users
+        SET telegram_conectado = 1
+        WHERE id = ?
+        `,
+        [userId]
       )
 
       io.to(`user:${userId}`).emit('telegram:connected', {
@@ -628,6 +661,7 @@ const bootstrapDatabase = async () => {
   await ensureDatabaseExists()
   await ensureTelegramConfigTable()
   await ensureUserTelegramConnectionsTable()
+  await ensureTelegramConnectedColumn()
   console.log('[bootstrap-database] telegram config e conexões garantidas')
 }
 
