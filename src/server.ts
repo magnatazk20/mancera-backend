@@ -252,6 +252,17 @@ const ensureTelegramConfigTable = async () => {
     // coluna já existe
   }
 
+  try {
+    await pool.query(
+      `
+      ALTER TABLE system_telegram_config
+      ADD COLUMN duplicate_connection_message TEXT NULL
+      `
+    )
+  } catch {
+    // coluna já existe
+  }
+
   await pool.query(
     `
     INSERT IGNORE INTO system_telegram_config (
