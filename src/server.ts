@@ -6,9 +6,10 @@ import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import { createServer } from 'http'
 import { Server as SocketIOServer } from 'socket.io'
-import pool from './db'
+import pool, { DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER } from './db'
 import type { NextFunction, Request, Response } from 'express'
 import type { RowDataPacket } from 'mysql2'
+import mysql from 'mysql2/promise'
 
 dotenv.config()
 
@@ -160,6 +161,23 @@ const resolveAuthUser = async (req: Request) => {
     }
   } catch {
     return null
+  }
+}
+
+const ensureDatabaseExists = async () => {
+  const conn = await mysql.createConnection({
+    host: DB_HOST,
+    port: DB_PORT,
+    user: DB_USER,
+    password: DB_PASSWORD,
+    charset: 'utf8mb4',
+  })
+
+  try {
+    await conn.query(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`)
+    console.log(`[db] database garantido: ${DB_NAME}@${DB_HOST}:${DB_PORT}`)
+  } finally {
+    await conn.end()
   }
 }
 
@@ -583,8 +601,10 @@ app.use(cors())
 app.use(express.json())
 
 const bootstrapDatabase = async () => {
+  await ensureDatabaseExists()
   await ensureTelegramConfigTable()
   await ensureUserTelegramConnectionsTable()
+  console.log('[bootstrap-database] telegram config e conexões garantidas')
 }
 
 bootstrapDatabase().catch((err) => {
@@ -6197,6 +6217,51 @@ app.get('/api/telegram/connection-status/:userId', requireAuth, async (req: Auth
   } catch (err) {
     console.error('[telegram-connection-status]', err)
     res.status(500).json({ ok: false, error: 'Erro ao carregar status de conexão do Telegram.' })
+  }
+})
+
+app.get('/api/admin/telegram-config/diagnostic', requireMaxAdmin, async (_req, res) => {
+  try {
+    await ensureDatabaseExists()
+    await ensureTelegramConfigTable()
+
+    const [tableRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COUNT(*) AS total
+      FROM information_schema.tables
+      WHERE table_schema = DATABASE()
+        AND table_name = 'system_telegram_config'
+      `
+    )
+
+    const [countRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COUNT(*) AS total
+      FROM system_telegram_config
+      `
+    )
+
+    res.json({
+      ok: true,
+      diagnostic: {
+        dbHost: DB_HOST,
+        dbPort: DB_PORT,
+        dbName: DB_NAME,
+        tableExists: Number(tableRows[0]?.total ?? 0) > 0,
+        rowsInSystemTelegramConfig: Number(countRows[0]?.total ?? 0),
+      },
+    })
+  } catch (err) {
+    console.error('[admin-telegram-config-diagnostic]', err)
+    res.status(500).json({
+      ok: false,
+      error: 'Erro ao executar diagnóstico de configuração Telegram.',
+      diagnostic: {
+        dbHost: DB_HOST,
+        dbPort: DB_PORT,
+        dbName: DB_NAME,
+      },
+    })
   }
 })
 
