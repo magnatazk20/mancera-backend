@@ -7332,6 +7332,29 @@ app.post('/api/admin/migrate-balance-columns', async (_req, res) => {
       `
     )
 
+    await pool.query(
+      `
+      CREATE TABLE IF NOT EXISTS system_telegram_config (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        singleton_key TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        bot_token VARCHAR(255) NOT NULL DEFAULT '',
+        group_id VARCHAR(255) NOT NULL DEFAULT '',
+        welcome_message TEXT NULL,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_system_telegram_config_singleton (singleton_key)
+      )
+      `
+    )
+
+    await pool.query(
+      `
+      INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message)
+      VALUES (1, '', '', '')
+      `
+    )
+
     const [vipCountRows] = await pool.query<RowDataPacket[]>(
       'SELECT COUNT(*) AS total FROM vip_levels'
     )
