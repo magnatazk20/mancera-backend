@@ -1,0 +1,5 @@
+- [ ] Adicionar coluna `private_link_success_message` em `system_telegram_config` com migração defensiva e fallback
+- [ ] Expor/salvar `privateLinkSuccessMessage` nos endpoints `/api/admin/telegram-config` (GET/POST)
+- [ ] Usar `privateLinkSuccessMessage` no fluxo de sucesso de vinculação no chat privado
+- [ ] Build backend e validação básica
+- [ ] Commit e push backend

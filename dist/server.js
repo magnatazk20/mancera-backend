@@ -195,8 +195,9 @@ const ensureTelegramConfigTable = async () => {
       bot_token VARCHAR(255) NOT NULL DEFAULT '',
       group_id VARCHAR(255) NOT NULL DEFAULT '',
       welcome_message TEXT NULL,
-      private_chat_only_message TEXT NULL,
-      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        private_chat_only_message TEXT NULL,
+        private_link_success_message TEXT NULL,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       UNIQUE KEY uq_system_telegram_config_singleton (singleton_key)
@@ -234,14 +235,42 @@ const ensureTelegramConfigTable = async () => {
     catch {
         // coluna já existe
     }
+    try {
+        await db_1.default.query(`
+      ALTER TABLE system_telegram_config
+      ADD COLUMN private_link_success_message TEXT NULL
+      `);
+    }
+    catch {
+        // coluna já existe
+    }
     await db_1.default.query(`
-    INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message, private_chat_only_message)
-    VALUES (1, '', '', '', 'Conexão permitida somente no chat privado do bot.')
+    INSERT IGNORE INTO system_telegram_config (
+      singleton_key,
+      bot_token,
+      group_id,
+      welcome_message,
+      private_chat_only_message,
+      private_link_success_message
+    )
+    VALUES (
+      1,
+      '',
+      '',
+      '',
+      'Conexão permitida somente no chat privado do bot.',
+      'Conta conectada com sucesso.'
+    )
     `);
     await db_1.default.query(`
     UPDATE system_telegram_config
     SET private_chat_only_message = 'Conexão permitida somente no chat privado do bot.'
     WHERE private_chat_only_message IS NULL OR TRIM(private_chat_only_message) = ''
+    `);
+    await db_1.default.query(`
+    UPDATE system_telegram_config
+    SET private_link_success_message = 'Conta conectada com sucesso.'
+    WHERE private_link_success_message IS NULL OR TRIM(private_link_success_message) = ''
     `);
 };
 const ensureUserTelegramConnectionsTable = async () => {
@@ -289,7 +318,12 @@ const processTelegramUpdates = async () => {
         await ensureTelegramConfigTable();
         await ensureUserTelegramConnectionsTable();
         const [configRows] = await db_1.default.query(`
-      SELECT bot_token AS botToken, group_id AS groupId, welcome_message AS welcomeMessage, private_chat_only_message AS privateChatOnlyMessage
+      SELECT
+        bot_token AS botToken,
+        group_id AS groupId,
+        welcome_message AS welcomeMessage,
+        private_chat_only_message AS privateChatOnlyMessage,
+        private_link_success_message AS privateLinkSuccessMessage
       FROM system_telegram_config
       WHERE TRIM(bot_token) <> ''
       ORDER BY id ASC
@@ -302,6 +336,7 @@ const processTelegramUpdates = async () => {
         const welcomeMessage = String(configRows[0].welcomeMessage ?? '').trim();
         const privateChatOnlyMessage = String(configRows[0].privateChatOnlyMessage ?? '').trim() ||
             'Conexão permitida somente no chat privado do bot.';
+        const privateLinkSuccessMessage = String(configRows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
         if (!botToken)
             return;
         const updatesUrl = `https://api.telegram.org/bot${botToken}/getUpdates?timeout=25${telegramUpdateOffset > 0 ? `&offset=${telegramUpdateOffset}` : ''}`;
@@ -417,7 +452,7 @@ const processTelegramUpdates = async () => {
                 telegramUserId,
                 connectedAt: new Date().toISOString(),
             });
-            await sendTelegramMessage(botToken, chatId, 'Conta conectada com sucesso.');
+            await sendTelegramMessage(botToken, chatId, privateLinkSuccessMessage);
         }
     }
     catch (err) {
@@ -4994,6 +5029,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         group_id AS groupId,
         welcome_message AS welcomeMessage,
         private_chat_only_message AS privateChatOnlyMessage,
+        private_link_success_message AS privateLinkSuccessMessage,
         updated_at AS updatedAt
       FROM system_telegram_config
       ORDER BY id ASC
@@ -5007,6 +5043,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                     groupId: '',
                     welcomeMessage: '',
                     privateChatOnlyMessage: 'Conexão permitida somente no chat privado do bot.',
+                    privateLinkSuccessMessage: 'Conta conectada com sucesso.',
                     updatedAt: null,
                 },
             });
@@ -5020,6 +5057,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
                 welcomeMessage: String(rows[0].welcomeMessage ?? ''),
                 privateChatOnlyMessage: String(rows[0].privateChatOnlyMessage ?? '').trim() ||
                     'Conexão permitida somente no chat privado do bot.',
+                privateLinkSuccessMessage: String(rows[0].privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.',
                 updatedAt: rows[0].updatedAt ?? null,
             },
         });
@@ -5030,12 +5068,13 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
     }
 });
 app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
-    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage } = req.body;
+    const { botToken, groupId, welcomeMessage, privateChatOnlyMessage, privateLinkSuccessMessage } = req.body;
     const parsedBotToken = String(botToken ?? '').trim();
     const parsedGroupId = String(groupId ?? '').trim();
     const parsedWelcomeMessage = String(welcomeMessage ?? '').trim();
     const parsedPrivateChatOnlyMessage = String(privateChatOnlyMessage ?? '').trim() ||
         'Conexão permitida somente no chat privado do bot.';
+    const parsedPrivateLinkSuccessMessage = String(privateLinkSuccessMessage ?? '').trim() || 'Conta conectada com sucesso.';
     if (!parsedBotToken) {
         res.status(400).json({ ok: false, error: 'Bot token é obrigatório.' });
         return;
@@ -5047,15 +5086,29 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
     try {
         await ensureTelegramConfigTable();
         await db_1.default.query(`
-      INSERT INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message, private_chat_only_message)
-      VALUES (1, ?, ?, ?, ?)
+      INSERT INTO system_telegram_config (
+        singleton_key,
+        bot_token,
+        group_id,
+        welcome_message,
+        private_chat_only_message,
+        private_link_success_message
+      )
+      VALUES (1, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         bot_token = VALUES(bot_token),
         group_id = VALUES(group_id),
         welcome_message = VALUES(welcome_message),
         private_chat_only_message = VALUES(private_chat_only_message),
+        private_link_success_message = VALUES(private_link_success_message),
         updated_at = NOW()
-      `, [parsedBotToken, parsedGroupId, parsedWelcomeMessage, parsedPrivateChatOnlyMessage]);
+      `, [
+            parsedBotToken,
+            parsedGroupId,
+            parsedWelcomeMessage,
+            parsedPrivateChatOnlyMessage,
+            parsedPrivateLinkSuccessMessage,
+        ]);
         res.json({
             ok: true,
             message: 'Configuração do Telegram salva com sucesso.',
@@ -5064,6 +5117,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
                 groupId: parsedGroupId,
                 welcomeMessage: parsedWelcomeMessage,
                 privateChatOnlyMessage: parsedPrivateChatOnlyMessage,
+                privateLinkSuccessMessage: parsedPrivateLinkSuccessMessage,
             },
         });
     }
@@ -5953,8 +6007,15 @@ app.post('/api/admin/migrate-balance-columns', async (_req, res) => {
       )
       `);
         await db_1.default.query(`
-      INSERT IGNORE INTO system_telegram_config (singleton_key, bot_token, group_id, welcome_message, private_chat_only_message)
-      VALUES (1, '', '', '', 'Conexão permitida somente no chat privado do bot.')
+      INSERT IGNORE INTO system_telegram_config (
+        singleton_key,
+        bot_token,
+        group_id,
+        welcome_message,
+        private_chat_only_message,
+        private_link_success_message
+      )
+      VALUES (1, '', '', '', 'Conexão permitida somente no chat privado do bot.', 'Conta conectada com sucesso.')
       `);
         const [vipCountRows] = await db_1.default.query('SELECT COUNT(*) AS total FROM vip_levels');
         const totalVips = Number(vipCountRows[0]?.total ?? 0);
