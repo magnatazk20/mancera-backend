@@ -3820,6 +3820,126 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
         conn.release();
     }
 });
+app.get('/api/admin/commission-levels', requireMaxAdmin, async (_req, res) => {
+    try {
+        await ensureCommissionLevelsTable();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `);
+        const levels = rows.map((row) => ({
+            id: Number(row.id),
+            level: Number(row.level ?? 0),
+            name: String(row.name ?? ''),
+            commissionPercent: Number(row.commissionPercent ?? 0),
+            isActive: Number(row.isActive ?? 1) === 1,
+            createdAt: row.createdAt ?? null,
+            updatedAt: row.updatedAt ?? null,
+        }));
+        res.json({ ok: true, levels });
+    }
+    catch (err) {
+        console.error('[admin-commission-levels-get]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' });
+    }
+});
+app.post('/api/admin/commission-levels', requireMaxAdmin, async (req, res) => {
+    const { levels } = req.body;
+    if (!Array.isArray(levels) || levels.length === 0) {
+        res.status(400).json({ ok: false, error: 'Informe ao menos um nível de comissão.' });
+        return;
+    }
+    const normalized = levels.map((item) => {
+        const parsedLevel = Number(item?.level);
+        const parsedName = String(item?.name ?? '').trim();
+        const parsedCommissionPercent = Number(String(item?.commissionPercent ?? 0).replace(',', '.'));
+        const parsedIsActive = item?.isActive === true ||
+            item?.isActive === 1 ||
+            String(item?.isActive ?? '').toLowerCase() === 'true'
+            ? 1
+            : 0;
+        return {
+            id: item?.id == null ? null : Number(item.id),
+            level: parsedLevel,
+            name: parsedName,
+            commissionPercent: Number(parsedCommissionPercent.toFixed(2)),
+            isActive: parsedIsActive,
+        };
+    });
+    const hasInvalid = normalized.some((item) => !Number.isInteger(item.level) ||
+        item.level <= 0 ||
+        !item.name ||
+        !Number.isFinite(item.commissionPercent) ||
+        item.commissionPercent < 0 ||
+        item.commissionPercent > 100);
+    if (hasInvalid) {
+        res.status(400).json({
+            ok: false,
+            error: 'Dados inválidos. Nível deve ser inteiro positivo e comissão entre 0 e 100.',
+        });
+        return;
+    }
+    const uniqueLevels = new Set(normalized.map((item) => item.level));
+    if (uniqueLevels.size !== normalized.length) {
+        res.status(400).json({ ok: false, error: 'Existem níveis duplicados no envio.' });
+        return;
+    }
+    const conn = await db_1.default.getConnection();
+    try {
+        await ensureCommissionLevelsTable();
+        await conn.beginTransaction();
+        await conn.query('DELETE FROM commission_levels');
+        for (const item of normalized.sort((a, b) => a.level - b.level)) {
+            await conn.query(`
+        INSERT INTO commission_levels (level, name, commission_percent, is_active)
+        VALUES (?, ?, ?, ?)
+        `, [item.level, item.name, item.commissionPercent, item.isActive]);
+        }
+        await conn.commit();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `);
+        const persistedLevels = rows.map((row) => ({
+            id: Number(row.id),
+            level: Number(row.level ?? 0),
+            name: String(row.name ?? ''),
+            commissionPercent: Number(row.commissionPercent ?? 0),
+            isActive: Number(row.isActive ?? 1) === 1,
+            createdAt: row.createdAt ?? null,
+            updatedAt: row.updatedAt ?? null,
+        }));
+        res.json({
+            ok: true,
+            message: 'Níveis de comissão salvos com sucesso.',
+            levels: persistedLevels,
+        });
+    }
+    catch (err) {
+        await conn.rollback();
+        console.error('[admin-commission-levels-save]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao salvar níveis de comissão.' });
+    }
+    finally {
+        conn.release();
+    }
+});
 app.get('/api/admin/deposit-config', requireMaxAdmin, async (_req, res) => {
     try {
         await db_1.default.query(`
