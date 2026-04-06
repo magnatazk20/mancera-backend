@@ -7048,7 +7048,9 @@ app.get('/api/admin/users', requireMaxAdmin, async (_req, res) => {
         COALESCE(u.is_banned, 0) AS is_banned,
         COALESCE(u.balance, 0) AS balance,
         u.referred_by_user_id,
+        ref.id AS referrer_id,
         ref.name AS referrer_name,
+        ref.phone AS referrer_phone,
         u.created_at
       FROM users u
       LEFT JOIN users ref ON ref.id = u.referred_by_user_id
