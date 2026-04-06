@@ -1,5 +1,5 @@
-- [x] Validar backend Telegram config (campo private_chat_only_message já persistido em banco e exposto em GET/POST /api/admin/telegram-config)
-- [x] Validar uso da mensagem configurável no polling do bot para mensagens em grupo (chatType !== private)
-- [ ] Reverter alteração indevida feita anteriormente na regra de vínculo de chat Telegram
-- [ ] Executar revisão final de server.ts
-- [ ] Commit e push das alterações no backend
+- [ ] Reforçar reconciliação telegram_conectado por user_id e por telefone normalizado
+- [ ] Ajustar fluxo de vínculo para update adicional por telefone normalizado
+- [ ] Adicionar endpoint admin para reconciliação manual
+- [ ] Build do backend
+- [ ] Commit e push
