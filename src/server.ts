@@ -637,6 +637,12 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             `,
             [Number(existing.amount ?? amountBRL), Number(existing.amount ?? amountBRL), existing.user_id]
           )
+
+          await applyReferralCommissionsForDeposit(
+            Number(existing.id),
+            Number(existing.user_id),
+            Number(existing.amount ?? amountBRL)
+          )
         }
 
         res.status(200).send('OK')
@@ -681,6 +687,25 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           `,
           [amountBRL, amountBRL, userId]
         )
+
+        const [createdRows] = await pool.query<RowDataPacket[]>(
+          `
+          SELECT id
+          FROM cashin_payments
+          WHERE provider_transaction_id = ?
+          ORDER BY id DESC
+          LIMIT 1
+          `,
+          [providerTransactionId ? String(providerTransactionId) : '']
+        )
+
+        if (createdRows.length > 0) {
+          await applyReferralCommissionsForDeposit(
+            Number(createdRows[0].id),
+            userId,
+            amountBRL
+          )
+        }
       }
     }
 
@@ -3858,6 +3883,208 @@ const ensureCommissionLevelsTable = async () => {
   }
 }
 
+const ensureCommissionPayoutsTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS commission_payouts (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      cashin_payment_id BIGINT UNSIGNED NOT NULL,
+      depositor_user_id BIGINT UNSIGNED NOT NULL,
+      beneficiary_user_id BIGINT UNSIGNED NOT NULL,
+      referral_level TINYINT UNSIGNED NOT NULL,
+      commission_percent DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+      base_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      commission_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_commission_payout_unique (cashin_payment_id, beneficiary_user_id, referral_level),
+      KEY idx_commission_payouts_depositor (depositor_user_id),
+      KEY idx_commission_payouts_beneficiary (beneficiary_user_id)
+    )
+    `
+  )
+}
+
+const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depositorUserId: number, depositAmount: number) => {
+  const parsedPaymentId = Number(cashinPaymentId)
+  const parsedDepositorUserId = Number(depositorUserId)
+  const parsedDepositAmount = Number(depositAmount)
+
+  if (!parsedPaymentId || Number.isNaN(parsedPaymentId)) return
+  if (!parsedDepositorUserId || Number.isNaN(parsedDepositorUserId)) return
+  if (!Number.isFinite(parsedDepositAmount) || parsedDepositAmount <= 0) return
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    await ensureCommissionLevelsTable()
+    await ensureCommissionPayoutsTable()
+
+    const [levelRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT
+        level,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE level BETWEEN 1 AND 3
+      ORDER BY level ASC
+      `
+    )
+
+    const activeLevels = levelRows
+      .map((row) => ({
+        level: Number(row.level ?? 0),
+        commissionPercent: Number(row.commissionPercent ?? 0),
+        isActive: Number(row.isActive ?? 0) === 1,
+      }))
+      .filter((item) => item.isActive && item.level >= 1 && item.level <= 3 && item.commissionPercent > 0)
+
+    if (activeLevels.length === 0) {
+      await conn.commit()
+      return
+    }
+
+    let currentUserId = parsedDepositorUserId
+
+    for (let level = 1; level <= 3; level += 1) {
+      const [uplineRows] = await conn.query<RowDataPacket[]>(
+        `
+        SELECT referred_by_user_id AS referredByUserId
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [currentUserId]
+      )
+
+      if (uplineRows.length === 0) break
+
+      const parentUserId = Number(uplineRows[0].referredByUserId ?? 0)
+      if (!parentUserId || Number.isNaN(parentUserId)) break
+
+      const levelConfig = activeLevels.find((item) => item.level === level)
+      if (levelConfig) {
+        const commissionAmount = Number((parsedDepositAmount * (levelConfig.commissionPercent / 100)).toFixed(2))
+        if (commissionAmount > 0) {
+          const [existingPayoutRows] = await conn.query<RowDataPacket[]>(
+            `
+            SELECT id
+            FROM commission_payouts
+            WHERE cashin_payment_id = ?
+              AND beneficiary_user_id = ?
+              AND referral_level = ?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [parsedPaymentId, parentUserId, level]
+          )
+
+          if (existingPayoutRows.length === 0) {
+            await conn.query(
+              `
+              INSERT INTO commission_payouts
+              (
+                cashin_payment_id,
+                depositor_user_id,
+                beneficiary_user_id,
+                referral_level,
+                commission_percent,
+                base_amount,
+                commission_amount
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                parsedPaymentId,
+                parsedDepositorUserId,
+                parentUserId,
+                level,
+                Number(levelConfig.commissionPercent.toFixed(2)),
+                Number(parsedDepositAmount.toFixed(2)),
+                commissionAmount,
+              ]
+            )
+
+            await conn.query(
+              `
+              UPDATE users
+              SET balance = COALESCE(balance, 0) + ?
+              WHERE id = ?
+              `,
+              [commissionAmount, parentUserId]
+            )
+
+            await conn.query(
+              `
+              CREATE TABLE IF NOT EXISTS logs (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                user_id BIGINT UNSIGNED NULL,
+                entity_type VARCHAR(60) NOT NULL,
+                entity_id BIGINT UNSIGNED NULL,
+                action VARCHAR(100) NOT NULL,
+                old_balance DECIMAL(12,2) NULL,
+                new_balance DECIMAL(12,2) NULL,
+                amount DECIMAL(12,2) NULL,
+                metadata JSON NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                KEY idx_logs_user_id (user_id),
+                KEY idx_logs_entity_type (entity_type),
+                KEY idx_logs_entity_id (entity_id),
+                KEY idx_logs_action (action),
+                KEY idx_logs_created_at (created_at)
+              )
+              `
+            )
+
+            await conn.query(
+              `
+              INSERT INTO logs
+              (
+                user_id,
+                entity_type,
+                entity_id,
+                action,
+                amount,
+                metadata
+              )
+              VALUES (?, ?, ?, ?, ?, ?)
+              `,
+              [
+                parentUserId,
+                'commission',
+                parsedPaymentId,
+                'commission_credit',
+                commissionAmount,
+                JSON.stringify({
+                  cashinPaymentId: parsedPaymentId,
+                  depositorUserId: parsedDepositorUserId,
+                  beneficiaryUserId: parentUserId,
+                  level,
+                  commissionPercent: Number(levelConfig.commissionPercent.toFixed(2)),
+                  baseAmount: Number(parsedDepositAmount.toFixed(2)),
+                }),
+              ]
+            )
+          }
+        }
+      }
+
+      currentUserId = parentUserId
+    }
+
+    await conn.commit()
+  } catch (err) {
+    await conn.rollback()
+    throw err
+  } finally {
+    conn.release()
+  }
+}
+
 const ensureGiftCodeTables = async () => {
   await pool.query(
     `
@@ -6017,6 +6244,10 @@ app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => 
       }
 
       await conn.commit()
+
+      if (!isCurrentlyPaid) {
+        await applyReferralCommissionsForDeposit(depositId, userId, amount)
+      }
       res.json({
         ok: true,
         message: isCurrentlyPaid ? 'Depósito já estava aprovado.' : 'Depósito aprovado e saldo creditado.',
