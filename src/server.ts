@@ -487,28 +487,38 @@ const processTelegramUpdates = async () => {
         continue
       }
 
-      const [existingByUserRows] = await pool.query<RowDataPacket[]>(
-        `
-        SELECT telegram_chat_id AS telegramChatId
-        FROM user_telegram_connections
-        WHERE user_id = ?
-        LIMIT 1
-        `,
-        [userId]
-      )
-
-      if (existingByUserRows.length > 0) {
-        await sendTelegramMessage(
-          botToken,
-          chatId,
-          'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
-        )
-        continue
-      }
-
       const conn = await pool.getConnection()
       try {
         await conn.beginTransaction()
+
+        const [existingByUserRowsTx] = await conn.query<RowDataPacket[]>(
+          `
+          SELECT id
+          FROM user_telegram_connections
+          WHERE user_id = ?
+          LIMIT 1
+          FOR UPDATE
+          `,
+          [userId]
+        )
+
+        if (existingByUserRowsTx.length > 0) {
+          await conn.query(
+            `
+            UPDATE users
+            SET telegram_conectado = 1
+            WHERE id = ?
+            `,
+            [userId]
+          )
+          await conn.commit()
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.'
+          )
+          continue
+        }
 
         await conn.query(
           `
@@ -524,13 +534,6 @@ const processTelegramUpdates = async () => {
             connected_at
           )
           VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
-          ON DUPLICATE KEY UPDATE
-            telegram_chat_id = VALUES(telegram_chat_id),
-            telegram_user_id = VALUES(telegram_user_id),
-            telegram_username = VALUES(telegram_username),
-            telegram_first_name = VALUES(telegram_first_name),
-            is_connected = 1,
-            updated_at = NOW()
           `,
           [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]
         )
