@@ -721,7 +721,32 @@ const processTelegramUpdates = async () => {
         continue
       }
 
-      console.info('[telegram-link-success]', {
+      // 🔧 CHECK FINAL: confirma que é conexão NOVA (não duplicada)
+      const [finalUserConnectionCheck] = await pool.query<RowDataPacket[]>(`
+        SELECT COUNT(*) as connectionCount
+        FROM user_telegram_connections 
+        WHERE user_id = ?
+      `, [userId])
+
+      const existingConnections = Number(finalUserConnectionCheck[0]?.connectionCount ?? 0)
+      
+      if (existingConnections > 1) {
+        console.warn('[telegram-link-duplicate-detected] múltiplas conexões detectadas para mesmo user_id', {
+          userId,
+          normalizedIncomingPhone,
+          chatId,
+          telegramUserId,
+          totalConnections: existingConnections
+        })
+        await sendTelegramMessage(
+          botToken,
+          chatId,
+          '❌ Esta conta já possui conexão ativa com o Telegram.'
+        )
+        continue
+      }
+
+      console.info('[telegram-link-success-confirmed]', {
         userId,
         normalizedIncomingPhone,
         chatId,

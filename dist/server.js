@@ -293,6 +293,39 @@ const ensureUserTelegramConnectionsTable = async () => {
     )
     `);
 };
+const ensureTelegramConnectedColumn = async () => {
+    try {
+        await db_1.default.query(`
+      ALTER TABLE users
+      ADD COLUMN telegram_conectado TINYINT(1) NOT NULL DEFAULT 0
+      `);
+    }
+    catch {
+        // coluna já existe
+    }
+};
+const ensureTelegramConnectedSync = async () => {
+    try {
+        await db_1.default.query(`
+      UPDATE users u
+      INNER JOIN user_telegram_connections utc ON utc.user_id = u.id
+      SET u.telegram_conectado = 1
+      WHERE COALESCE(utc.is_connected, 1) = 1
+      `);
+        await db_1.default.query(`
+      UPDATE users u
+      INNER JOIN (
+        SELECT DISTINCT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') AS normalized_phone
+        FROM user_telegram_connections
+        WHERE phone IS NOT NULL AND TRIM(phone) <> ''
+      ) t ON REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = t.normalized_phone
+      SET u.telegram_conectado = 1
+      `);
+    }
+    catch (err) {
+        console.error('[ensure-telegram-connected-sync]', err);
+    }
+};
 const normalizePhoneForCompare = (value) => String(value ?? '').replace(/\D/g, '');
 const sendTelegramMessage = async (botToken, chatId, text) => {
     if (!botToken || !chatId)
@@ -317,6 +350,8 @@ const processTelegramUpdates = async () => {
     try {
         await ensureTelegramConfigTable();
         await ensureUserTelegramConnectionsTable();
+        await ensureTelegramConnectedColumn();
+        await ensureTelegramConnectedSync();
         const [configRows] = await db_1.default.query(`
       SELECT
         bot_token AS botToken,
@@ -397,7 +432,7 @@ const processTelegramUpdates = async () => {
                 continue;
             }
             const [userRows] = await db_1.default.query(`
-        SELECT id, phone
+        SELECT id, phone, telegram_conectado AS telegramConectado
         FROM users
         WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
         LIMIT 1
@@ -408,42 +443,171 @@ const processTelegramUpdates = async () => {
             }
             const userId = Number(userRows[0].id);
             const phone = String(userRows[0].phone ?? '');
-            const [existingByUserRows] = await db_1.default.query(`
-        SELECT telegram_chat_id AS telegramChatId
+            const telegramConectado = Number(userRows[0].telegramConectado ?? 0);
+            const [existingByChatOrTelegramUserRows] = await db_1.default.query(`
+        SELECT id
         FROM user_telegram_connections
-        WHERE user_id = ?
+        WHERE (telegram_chat_id = ? OR telegram_user_id = ?)
+          AND COALESCE(is_connected, 1) = 1
         LIMIT 1
-        `, [userId]);
-            if (existingByUserRows.length > 0) {
-                const existingChatId = String(existingByUserRows[0].telegramChatId ?? '').trim();
-                if (existingChatId && existingChatId !== chatId) {
-                    await sendTelegramMessage(botToken, chatId, 'Esta conta já está conectada em outro Telegram e não pode ser vinculada novamente.');
+        `, [chatId, telegramUserId]);
+            if (existingByChatOrTelegramUserRows.length > 0) {
+                await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
+                continue;
+            }
+            const [existingByPhoneRows] = await db_1.default.query(`
+        SELECT id
+        FROM user_telegram_connections
+        WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          AND COALESCE(is_connected, 1) = 1
+        LIMIT 1
+        `, [normalizedIncomingPhone]);
+            if (existingByPhoneRows.length > 0 || telegramConectado === 1) {
+                await db_1.default.query(`
+          UPDATE users
+          SET telegram_conectado = 1
+          WHERE id = ?
+             OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          `, [userId, normalizedIncomingPhone]);
+                await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
+                continue;
+            }
+            const conn = await db_1.default.getConnection();
+            try {
+                await conn.beginTransaction();
+                const [existingByUserRowsTx] = await conn.query(`
+          SELECT id
+          FROM user_telegram_connections
+          WHERE user_id = ?
+          LIMIT 1
+          FOR UPDATE
+          `, [userId]);
+                if (existingByUserRowsTx.length > 0) {
+                    await conn.query(`
+            UPDATE users
+            SET telegram_conectado = 1
+            WHERE id = ?
+            `, [userId]);
+                    await conn.commit();
+                    await sendTelegramMessage(botToken, chatId, 'Esta conta já foi conectada anteriormente e não pode ser vinculada novamente.');
                     continue;
                 }
+                await conn.query(`
+          INSERT INTO user_telegram_connections
+          (
+            user_id,
+            phone,
+            telegram_chat_id,
+            telegram_user_id,
+            telegram_username,
+            telegram_first_name,
+            is_connected,
+            connected_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
+          ON DUPLICATE KEY UPDATE
+            phone = VALUES(phone),
+            telegram_chat_id = VALUES(telegram_chat_id),
+            telegram_user_id = VALUES(telegram_user_id),
+            telegram_username = VALUES(telegram_username),
+            telegram_first_name = VALUES(telegram_first_name),
+            is_connected = 1,
+            updated_at = NOW()
+          `, [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]);
+                const [updateUserResult] = await conn.query(`
+          UPDATE users
+          SET telegram_conectado = 1
+          WHERE id = ?
+          `, [userId]);
+                await conn.query(`
+          UPDATE users
+          SET telegram_conectado = 1
+          WHERE REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          `, [normalizedIncomingPhone]);
+                const affectedRows = Number(updateUserResult?.affectedRows ?? 0);
+                if (affectedRows <= 0) {
+                    await conn.rollback();
+                    await sendTelegramMessage(botToken, chatId, 'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.');
+                    continue;
+                }
+                const [confirmTelegramFlagRows] = await conn.query(`
+          SELECT telegram_conectado AS telegramConectado
+          FROM users
+          WHERE id = ?
+             OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          LIMIT 1
+          `, [userId, normalizedIncomingPhone]);
+                const telegramFlagPersisted = confirmTelegramFlagRows.some((row) => Number(row?.telegramConectado ?? 0) === 1);
+                if (!telegramFlagPersisted) {
+                    await conn.query(`
+            UPDATE users
+            SET telegram_conectado = 1
+            WHERE id = ?
+               OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+            `, [userId, normalizedIncomingPhone]);
+                }
+                await conn.commit();
+                await ensureTelegramConnectedSync();
             }
-            await db_1.default.query(`
-        INSERT INTO user_telegram_connections
-        (
-          user_id,
-          phone,
-          telegram_chat_id,
-          telegram_user_id,
-          telegram_username,
-          telegram_first_name,
-          is_connected,
-          connected_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 1, NOW())
-        ON DUPLICATE KEY UPDATE
-          phone = VALUES(phone),
-          telegram_chat_id = VALUES(telegram_chat_id),
-          telegram_user_id = VALUES(telegram_user_id),
-          telegram_username = VALUES(telegram_username),
-          telegram_first_name = VALUES(telegram_first_name),
-          is_connected = 1,
-          connected_at = NOW(),
-          updated_at = NOW()
-        `, [userId, phone, chatId, telegramUserId, telegramUsername, telegramFirstName]);
+            catch (txErr) {
+                await conn.rollback();
+                console.error('[telegram-link-transaction]', txErr);
+                await sendTelegramMessage(botToken, chatId, 'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.');
+                continue;
+            }
+            finally {
+                conn.release();
+            }
+            const [finalExistingRows] = await db_1.default.query(`
+        SELECT id
+        FROM user_telegram_connections
+        WHERE
+          (
+            user_id = ?
+            OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          )
+          AND
+          (
+            telegram_chat_id = ?
+            OR telegram_user_id = ?
+          )
+          AND COALESCE(is_connected, 1) = 1
+        LIMIT 1
+        `, [userId, normalizedIncomingPhone, chatId, telegramUserId]);
+            if (finalExistingRows.length <= 0) {
+                console.warn('[telegram-link-final-guard] vínculo não confirmado após transação', {
+                    userId,
+                    normalizedIncomingPhone,
+                    chatId,
+                    telegramUserId,
+                });
+                await sendTelegramMessage(botToken, chatId, 'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.');
+                continue;
+            }
+            // 🔧 CHECK FINAL: confirma que é conexão NOVA (não duplicada)
+            const [finalUserConnectionCheck] = await db_1.default.query(`
+        SELECT COUNT(*) as connectionCount
+        FROM user_telegram_connections 
+        WHERE user_id = ?
+      `, [userId]);
+            const existingConnections = Number(finalUserConnectionCheck[0]?.connectionCount ?? 0);
+            if (existingConnections > 1) {
+                console.warn('[telegram-link-duplicate-detected] múltiplas conexões detectadas para mesmo user_id', {
+                    userId,
+                    normalizedIncomingPhone,
+                    chatId,
+                    telegramUserId,
+                    totalConnections: existingConnections
+                });
+                await sendTelegramMessage(botToken, chatId, '❌ Esta conta já possui conexão ativa com o Telegram.');
+                continue;
+            }
+            console.info('[telegram-link-success-confirmed]', {
+                userId,
+                normalizedIncomingPhone,
+                chatId,
+                telegramUserId,
+            });
             io.to(`user:${userId}`).emit('telegram:connected', {
                 ok: true,
                 userId,
@@ -553,6 +717,8 @@ const bootstrapDatabase = async () => {
     await ensureDatabaseExists();
     await ensureTelegramConfigTable();
     await ensureUserTelegramConnectionsTable();
+    await ensureTelegramConnectedColumn();
+    await ensureTelegramConnectedSync();
     console.log('[bootstrap-database] telegram config e conexões garantidas');
 };
 bootstrapDatabase().catch((err) => {
@@ -5124,6 +5290,18 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
     catch (err) {
         console.error('[admin-telegram-config-save]', err);
         res.status(500).json({ ok: false, error: 'Erro ao salvar configuração do Telegram.' });
+    }
+});
+app.post('/api/admin/telegram-reconcile-now', requireMaxAdmin, async (_req, res) => {
+    try {
+        await ensureUserTelegramConnectionsTable();
+        await ensureTelegramConnectedColumn();
+        await ensureTelegramConnectedSync();
+        res.json({ ok: true, message: 'Reconciliação Telegram executada com sucesso.' });
+    }
+    catch (err) {
+        console.error('[admin-telegram-reconcile-now]', err);
+        res.status(500).json({ ok: false, error: 'Falha ao executar reconciliação Telegram.' });
     }
 });
 app.get('/api/admin/site-settings', requireMaxAdmin, async (_req, res) => {
