@@ -686,6 +686,48 @@ const processTelegramUpdates = async () => {
         conn.release()
       }
 
+      const [finalExistingRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT id
+        FROM user_telegram_connections
+        WHERE
+          (
+            user_id = ?
+            OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = ?
+          )
+          AND
+          (
+            telegram_chat_id = ?
+            OR telegram_user_id = ?
+          )
+          AND COALESCE(is_connected, 1) = 1
+        LIMIT 1
+        `,
+        [userId, normalizedIncomingPhone, chatId, telegramUserId]
+      )
+
+      if (finalExistingRows.length <= 0) {
+        console.warn('[telegram-link-final-guard] vínculo não confirmado após transação', {
+          userId,
+          normalizedIncomingPhone,
+          chatId,
+          telegramUserId,
+        })
+        await sendTelegramMessage(
+          botToken,
+          chatId,
+          'Não foi possível concluir o vínculo da conta. Tente novamente mais tarde.'
+        )
+        continue
+      }
+
+      console.info('[telegram-link-success]', {
+        userId,
+        normalizedIncomingPhone,
+        chatId,
+        telegramUserId,
+      })
+
       io.to(`user:${userId}`).emit('telegram:connected', {
         ok: true,
         userId,
