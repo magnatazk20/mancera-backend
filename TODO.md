@@ -1,7 +1,0 @@
-- [x] Mapear pontos do backend/frontend para Telegram config
-- [ ] Atualizar backend para suportar welcome_message na system_telegram_config
-- [ ] Ajustar /api/admin/telegram-config GET/POST para welcomeMessage
-- [ ] Implementar resposta ao /start no privado com mensagem configurável
-- [ ] Atualizar página AdminTelegramConfig com campo de mensagem de boas-vindas
-- [ ] Validar build do backend
-- [ ] Commit e push das alterações
