@@ -1,6 +1,4 @@
-- [x] Reforçar reconciliação telegram_conectado por user_id e por telefone normalizado
-- [x] Ajustar fluxo de vínculo para update adicional por telefone normalizado
-- [x] Adicionar endpoint admin para reconciliação manual
-- [x] Corrigir conflito de collation em ensureTelegramConnectedSync (comparação por telefone normalizado)
-- [x] Build do backend
-- [ ] Commit e push
+- [ ] Ajustar normalização/comparação do group_id para responder /checkin exatamente no grupo configurado
+- [ ] Adicionar logs de diagnóstico no fluxo de updates do Telegram
+- [ ] Validar build TypeScript
+- [ ] Commit e push das mudanças

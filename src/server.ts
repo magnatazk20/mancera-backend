@@ -629,15 +629,35 @@ const processTelegramUpdates = async () => {
       const telegramFirstName = String(message?.from?.first_name ?? '').trim() || null
       const textRaw = String(message?.text ?? message?.caption ?? '').trim()
       const textLower = textRaw.toLowerCase()
-      const normalizedConfiguredGroupId = configuredGroupId.replace(/^-100/, '').trim()
-      const normalizedChatId = chatId.replace(/^-100/, '').trim()
-      if (!chatId || !telegramUserId) continue
+      const sanitizeGroupId = (value: string) =>
+        String(value ?? '').replace(/[^\d-]/g, '').replace(/^-+/, '-').trim()
+      const configuredGroupIdSanitized = sanitizeGroupId(configuredGroupId)
+      const chatIdSanitized = sanitizeGroupId(chatId)
+      const normalizedConfiguredGroupId = configuredGroupIdSanitized.replace(/^-100/, '').trim()
+      const normalizedChatId = chatIdSanitized.replace(/^-100/, '').trim()
+      if (!chatIdSanitized || !telegramUserId) continue
 
       const isGroupMessage = chatType === 'group' || chatType === 'supergroup'
       const isConfiguredGroupMessage =
-        configuredGroupId &&
+        configuredGroupIdSanitized &&
         isGroupMessage &&
-        (chatId === configuredGroupId || normalizedChatId === normalizedConfiguredGroupId)
+        (
+          chatIdSanitized === configuredGroupIdSanitized ||
+          normalizedChatId === normalizedConfiguredGroupId
+        )
+
+      console.info('[telegram-group-match]', {
+        chatId,
+        chatIdSanitized,
+        configuredGroupId,
+        configuredGroupIdSanitized,
+        normalizedChatId,
+        normalizedConfiguredGroupId,
+        chatType,
+        isGroupMessage,
+        isConfiguredGroupMessage,
+        textRaw,
+      })
 
       if (messageId > 0) {
         const messageKey = `${chatId}:${messageId}`
@@ -652,9 +672,10 @@ const processTelegramUpdates = async () => {
       }
 
       if (isConfiguredGroupMessage) {
+        const normalizedCommandText = textLower.replace(/\s+/g, '')
         const isCheckinCommand =
-          textLower === '/checkin' ||
-          textLower.startsWith('/checkin@')
+          normalizedCommandText === '/checkin' ||
+          normalizedCommandText.startsWith('/checkin@')
 
         if (!isCheckinCommand) {
           continue
