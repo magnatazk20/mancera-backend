@@ -748,13 +748,6 @@ const processTelegramUpdates = async () => {
       }
 
       if (chatType !== 'private') {
-        if (hasConfiguredGroup && !isConfiguredGroupMessage) {
-          await sendTelegramMessage(
-            botToken,
-            chatId,
-            privateChatOnlyMessage
-          )
-        }
         continue
       }
 
