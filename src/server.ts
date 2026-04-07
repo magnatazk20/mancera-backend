@@ -737,11 +737,25 @@ const processTelegramUpdates = async () => {
         const linkedUserId = Number(connectionRows[0].userId ?? 0)
         const claimResult = await claimCheckinForUser(linkedUserId)
 
+        const telegramDisplayName = telegramUsername
+          ? `@${telegramUsername}`
+          : (telegramFirstName || 'usuário')
+        const checkinDay = Number((claimResult as any)?.claim?.day ?? 0)
+        const rewardAmount = Number((claimResult as any)?.claim?.rewardAmount ?? 0)
+        const rewardFormatted = rewardAmount.toFixed(2).replace('.', ',')
+        const successMessage =
+`✅ Check-in realizado com sucesso! ${telegramDisplayName}
+
+💎 Recompensa de hoje: +${rewardFormatted} USDT 
+
+📅 Progresso: Dia ${checkinDay}/10
+✨ Amanhã você atinge o Super Ponto de Combo! Venha fazer o check-in amanhã e você ganhará múltiplos dias de graça de uma só vez. Não ouse faltar!`
+
         await sendTelegramMessage(
           botToken,
           chatId,
           claimResult.ok
-            ? String(claimResult.message ?? '✅ Check-in realizado com sucesso!')
+            ? successMessage
             : String(claimResult.error ?? 'Não foi possível processar seu check-in.')
         )
         continue
