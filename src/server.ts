@@ -644,9 +644,7 @@ const processTelegramUpdates = async () => {
       }
 
       if (configuredGroupId && chatId === configuredGroupId) {
-        const isCheckinCommand =
-          textLower === '/checkin' ||
-          textLower.startsWith('/checkin@')
+        const isCheckinCommand = textLower === '/checkin'
 
         if (!isCheckinCommand) {
           continue
@@ -680,7 +678,7 @@ const processTelegramUpdates = async () => {
           botToken,
           chatId,
           claimResult.ok
-            ? `${claimResult.message} (+R$ ${Number(claimResult.claim?.rewardAmount ?? 0).toFixed(2)})`
+            ? '✅ Check-in realizado com sucesso! Você recebeu R$ 1,00.'
             : String(claimResult.error ?? 'Não foi possível processar seu check-in.')
         )
         continue
