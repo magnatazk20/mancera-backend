@@ -1,24 +1,27 @@
-import mysql from 'mysql2/promise'
-import dotenv from 'dotenv'
+import Database from 'better-sqlite3'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import fs from 'fs'
 
-dotenv.config()
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const dbPath = path.join(__dirname, '../noor661.db')
 
-export const DB_HOST = process.env.DB_HOST ?? 'localhost'
-export const DB_PORT = Number(process.env.DB_PORT ?? 3306)
-export const DB_USER = process.env.DB_USER ?? 'root'
-export const DB_PASSWORD = process.env.DB_PASSWORD ?? ''
-export const DB_NAME = process.env.DB_NAME ?? 'noor661'
+// Ensure data directory exists
+const dataDir = path.dirname(dbPath)
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true })
+}
 
-const pool = mysql.createPool({
-  host: DB_HOST,
-  port: DB_PORT,
-  user: DB_USER,
-  password: DB_PASSWORD,
-  database: DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  charset: 'utf8mb4',
+const db = new Database(dbPath, {
+  verbose: process.env.NODE_ENV === 'development' ? console.log : undefined
 })
 
-export default pool
+// Enable foreign keys
+db.exec('PRAGMA foreign_keys = ON;')
+// Enable WAL mode for better concurrency
+db.exec('PRAGMA journal_mode = WAL;')
+// Enable JSON1 extension
+db.exec('PRAGMA functions = json;')
+
+export const DB_PATH = dbPath
+export default db

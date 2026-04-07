@@ -4796,6 +4796,34 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
         conn.release();
     }
 });
+app.get('/api/referral/commission-levels', async (_req, res) => {
+    try {
+        await ensureCommissionLevelsTable();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE is_active = 1
+      ORDER BY level ASC, id ASC
+      `);
+        const levels = rows.map((row) => ({
+            id: Number(row.id),
+            level: Number(row.level ?? 0),
+            name: String(row.name ?? ''),
+            commissionPercent: Number(row.commissionPercent ?? 0),
+            isActive: Number(row.isActive ?? 1) === 1,
+        }));
+        res.json({ ok: true, levels });
+    }
+    catch (err) {
+        console.error('[referral-commission-levels-get]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão para convite.' });
+    }
+});
 app.get('/api/admin/commission-levels', requireMaxAdmin, async (_req, res) => {
     try {
         await ensureCommissionLevelsTable();
