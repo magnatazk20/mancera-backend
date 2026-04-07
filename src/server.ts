@@ -627,11 +627,17 @@ const processTelegramUpdates = async () => {
       const telegramUserId = String(message?.from?.id ?? '').trim()
       const telegramUsername = String(message?.from?.username ?? '').trim() || null
       const telegramFirstName = String(message?.from?.first_name ?? '').trim() || null
-      const textRaw = String(message?.text ?? '').trim()
+      const textRaw = String(message?.text ?? message?.caption ?? '').trim()
       const textLower = textRaw.toLowerCase()
       const normalizedConfiguredGroupId = configuredGroupId.replace(/^-100/, '').trim()
       const normalizedChatId = chatId.replace(/^-100/, '').trim()
-      if (!chatId || !telegramUserId || !textRaw) continue
+      if (!chatId || !telegramUserId) continue
+
+      const isGroupMessage = chatType === 'group' || chatType === 'supergroup'
+      const isConfiguredGroupMessage =
+        configuredGroupId &&
+        isGroupMessage &&
+        (chatId === configuredGroupId || normalizedChatId === normalizedConfiguredGroupId)
 
       if (messageId > 0) {
         const messageKey = `${chatId}:${messageId}`
@@ -645,10 +651,7 @@ const processTelegramUpdates = async () => {
         }
       }
 
-      if (
-        configuredGroupId &&
-        (chatId === configuredGroupId || normalizedChatId === normalizedConfiguredGroupId)
-      ) {
+      if (isConfiguredGroupMessage) {
         const isCheckinCommand =
           textLower === '/checkin' ||
           textLower.startsWith('/checkin@')
@@ -692,13 +695,17 @@ const processTelegramUpdates = async () => {
       }
 
       if (chatType !== 'private') {
-        await sendTelegramMessage(
-          botToken,
-          chatId,
-          privateChatOnlyMessage
-        )
+        if (!isGroupMessage || !isConfiguredGroupMessage) {
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            privateChatOnlyMessage
+          )
+        }
         continue
       }
+
+      if (!textRaw) continue
 
       const isStartCommand =
         textLower === '/start' || textLower.startsWith('/start@')
