@@ -244,6 +244,15 @@ const ensureTelegramConfigTable = async () => {
     catch {
         // coluna já existe
     }
+    try {
+        await db_1.default.query(`
+      ALTER TABLE system_telegram_config
+      ADD COLUMN duplicate_connection_message TEXT NULL
+      `);
+    }
+    catch {
+        // coluna já existe
+    }
     await db_1.default.query(`
     INSERT IGNORE INTO system_telegram_config (
       singleton_key,
@@ -318,7 +327,11 @@ const ensureTelegramConnectedSync = async () => {
         SELECT DISTINCT REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') AS normalized_phone
         FROM user_telegram_connections
         WHERE phone IS NOT NULL AND TRIM(phone) <> ''
-      ) t ON REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') = t.normalized_phone
+      ) t ON (
+        CONVERT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, ' ', ''), '-', ''), '(', ''), ')', ''), '+', '') USING utf8mb4) COLLATE utf8mb4_unicode_ci
+        =
+        CONVERT(t.normalized_phone USING utf8mb4) COLLATE utf8mb4_unicode_ci
+      )
       SET u.telegram_conectado = 1
       `);
     }
