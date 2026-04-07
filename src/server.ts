@@ -396,6 +396,178 @@ const sendTelegramMessage = async (botToken: string, chatId: string, text: strin
   }
 }
 
+const claimCheckinForUser = async (userId: number) => {
+  const parsedUserId = Number(userId)
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    return { ok: false as const, status: 400, error: 'ID de usuário inválido.' }
+  }
+
+  const rewards = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  const conn = await pool.getConnection()
+
+  try {
+    await conn.beginTransaction()
+
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS daily_checkins (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        checkin_day TINYINT UNSIGNED NOT NULL,
+        reward_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        checkin_date DATE NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_daily_checkins_user_day (user_id, checkin_date),
+        KEY idx_daily_checkins_user_id (user_id),
+        KEY idx_daily_checkins_day (checkin_day)
+      )
+      `
+    )
+
+    const [users] = await conn.query<RowDataPacket[]>(
+      'SELECT id, balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+      [parsedUserId]
+    )
+
+    if (users.length === 0) {
+      await conn.rollback()
+      return { ok: false as const, status: 404, error: 'Usuário não encontrado.' }
+    }
+
+    const [todayRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT id
+      FROM daily_checkins
+      WHERE user_id = ? AND checkin_date = CURDATE()
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [parsedUserId]
+    )
+
+    if (todayRows.length > 0) {
+      await conn.rollback()
+      return { ok: false as const, status: 400, error: 'Check-in de hoje já foi resgatado.' }
+    }
+
+    const [latestRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT checkin_day AS checkinDay
+      FROM daily_checkins
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [parsedUserId]
+    )
+
+    const latestDay = Number(latestRows[0]?.checkinDay ?? 0)
+    const checkinDay = latestDay >= 10 ? 1 : latestDay + 1
+    const rewardAmount = Number(rewards[checkinDay - 1] ?? 1)
+
+    const oldBalance = Number(users[0].balance ?? 0)
+
+    const [checkinInsertResult] = await conn.query(
+      `
+      INSERT INTO daily_checkins (user_id, checkin_day, reward_amount, checkin_date)
+      VALUES (?, ?, ?, CURDATE())
+      `,
+      [parsedUserId, checkinDay, rewardAmount]
+    ) as any
+
+    await conn.query(
+      `
+      UPDATE users
+      SET balance = COALESCE(balance, 0) + ?
+      WHERE id = ?
+      `,
+      [rewardAmount, parsedUserId]
+    )
+
+    const [updatedRows] = await conn.query<RowDataPacket[]>(
+      'SELECT balance FROM users WHERE id = ? LIMIT 1',
+      [parsedUserId]
+    )
+
+    const newBalance = Number(updatedRows[0]?.balance ?? oldBalance)
+
+    await conn.query(
+      `
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `
+    )
+
+    await conn.query(
+      `
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        old_balance,
+        new_balance,
+        amount,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        parsedUserId,
+        'checkin',
+        Number(checkinInsertResult?.insertId ?? 0),
+        'daily_checkin_claimed',
+        Number(oldBalance.toFixed(2)),
+        Number(newBalance.toFixed(2)),
+        Number(rewardAmount.toFixed(2)),
+        JSON.stringify({
+          checkinDay,
+          checkinDate: new Date().toISOString(),
+        }),
+      ]
+    )
+
+    await conn.commit()
+
+    return {
+      ok: true as const,
+      status: 200,
+      message: `Check-in do dia ${checkinDay} resgatado com sucesso!`,
+      claim: {
+        day: checkinDay,
+        rewardAmount,
+        checkinDate: new Date().toISOString(),
+      },
+      balance: Number(updatedRows[0]?.balance ?? 0),
+    }
+  } catch (err) {
+    await conn.rollback()
+    console.error('[checkin-claim]', err)
+    return { ok: false as const, status: 500, error: 'Erro ao resgatar check-in.' }
+  } finally {
+    conn.release()
+  }
+}
+
 const processTelegramUpdates = async () => {
   try {
     await ensureTelegramConfigTable()
@@ -472,6 +644,45 @@ const processTelegramUpdates = async () => {
       }
 
       if (configuredGroupId && chatId === configuredGroupId) {
+        const isCheckinCommand =
+          textLower === '/checkin' ||
+          textLower.startsWith('/checkin@')
+
+        if (!isCheckinCommand) {
+          continue
+        }
+
+        const [connectionRows] = await pool.query<RowDataPacket[]>(
+          `
+          SELECT user_id AS userId
+          FROM user_telegram_connections
+          WHERE telegram_user_id = ?
+            AND COALESCE(is_connected, 1) = 1
+          ORDER BY id DESC
+          LIMIT 1
+          `,
+          [telegramUserId]
+        )
+
+        if (connectionRows.length === 0) {
+          await sendTelegramMessage(
+            botToken,
+            chatId,
+            'Conta não vinculada. Primeiro envie seu telefone no chat privado do bot para conectar.'
+          )
+          continue
+        }
+
+        const linkedUserId = Number(connectionRows[0].userId ?? 0)
+        const claimResult = await claimCheckinForUser(linkedUserId)
+
+        await sendTelegramMessage(
+          botToken,
+          chatId,
+          claimResult.ok
+            ? `${claimResult.message} (+R$ ${Number(claimResult.claim?.rewardAmount ?? 0).toFixed(2)})`
+            : String(claimResult.error ?? 'Não foi possível processar seu check-in.')
+        )
         continue
       }
 
