@@ -364,6 +364,136 @@ const sendTelegramMessage = async (botToken, chatId, text) => {
         console.error('[telegram-send-message]', err);
     }
 };
+const claimCheckinForUser = async (userId) => {
+    const parsedUserId = Number(userId);
+    if (!parsedUserId || Number.isNaN(parsedUserId)) {
+        return { ok: false, status: 400, error: 'ID de usuário inválido.' };
+    }
+    const rewards = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+    const conn = await db_1.default.getConnection();
+    try {
+        await conn.beginTransaction();
+        await conn.query(`
+      CREATE TABLE IF NOT EXISTS daily_checkins (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        checkin_day TINYINT UNSIGNED NOT NULL,
+        reward_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        checkin_date DATE NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_daily_checkins_user_day (user_id, checkin_date),
+        KEY idx_daily_checkins_user_id (user_id),
+        KEY idx_daily_checkins_day (checkin_day)
+      )
+      `);
+        const [users] = await conn.query('SELECT id, balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE', [parsedUserId]);
+        if (users.length === 0) {
+            await conn.rollback();
+            return { ok: false, status: 404, error: 'Usuário não encontrado.' };
+        }
+        const [todayRows] = await conn.query(`
+      SELECT id
+      FROM daily_checkins
+      WHERE user_id = ? AND checkin_date = CURDATE()
+      LIMIT 1
+      FOR UPDATE
+      `, [parsedUserId]);
+        if (todayRows.length > 0) {
+            await conn.rollback();
+            return { ok: false, status: 400, error: 'Check-in de hoje já foi resgatado.' };
+        }
+        const [latestRows] = await conn.query(`
+      SELECT checkin_day AS checkinDay
+      FROM daily_checkins
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+      FOR UPDATE
+      `, [parsedUserId]);
+        const latestDay = Number(latestRows[0]?.checkinDay ?? 0);
+        const checkinDay = latestDay >= 10 ? 1 : latestDay + 1;
+        const rewardAmount = Number(rewards[checkinDay - 1] ?? 1);
+        const oldBalance = Number(users[0].balance ?? 0);
+        const [checkinInsertResult] = await conn.query(`
+      INSERT INTO daily_checkins (user_id, checkin_day, reward_amount, checkin_date)
+      VALUES (?, ?, ?, CURDATE())
+      `, [parsedUserId, checkinDay, rewardAmount]);
+        await conn.query(`
+      UPDATE users
+      SET balance = COALESCE(balance, 0) + ?
+      WHERE id = ?
+      `, [rewardAmount, parsedUserId]);
+        const [updatedRows] = await conn.query('SELECT balance FROM users WHERE id = ? LIMIT 1', [parsedUserId]);
+        const newBalance = Number(updatedRows[0]?.balance ?? oldBalance);
+        await conn.query(`
+      CREATE TABLE IF NOT EXISTS logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NULL,
+        entity_type VARCHAR(60) NOT NULL,
+        entity_id BIGINT UNSIGNED NULL,
+        action VARCHAR(100) NOT NULL,
+        old_balance DECIMAL(12,2) NULL,
+        new_balance DECIMAL(12,2) NULL,
+        amount DECIMAL(12,2) NULL,
+        metadata JSON NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_logs_user_id (user_id),
+        KEY idx_logs_entity_type (entity_type),
+        KEY idx_logs_entity_id (entity_id),
+        KEY idx_logs_action (action),
+        KEY idx_logs_created_at (created_at)
+      )
+      `);
+        await conn.query(`
+      INSERT INTO logs
+      (
+        user_id,
+        entity_type,
+        entity_id,
+        action,
+        old_balance,
+        new_balance,
+        amount,
+        metadata
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+            parsedUserId,
+            'checkin',
+            Number(checkinInsertResult?.insertId ?? 0),
+            'daily_checkin_claimed',
+            Number(oldBalance.toFixed(2)),
+            Number(newBalance.toFixed(2)),
+            Number(rewardAmount.toFixed(2)),
+            JSON.stringify({
+                checkinDay,
+                checkinDate: new Date().toISOString(),
+            }),
+        ]);
+        await conn.commit();
+        return {
+            ok: true,
+            status: 200,
+            message: `Check-in do dia ${checkinDay} resgatado com sucesso!`,
+            claim: {
+                day: checkinDay,
+                rewardAmount,
+                checkinDate: new Date().toISOString(),
+            },
+            balance: Number(updatedRows[0]?.balance ?? 0),
+        };
+    }
+    catch (err) {
+        await conn.rollback();
+        console.error('[checkin-claim]', err);
+        return { ok: false, status: 500, error: 'Erro ao resgatar check-in.' };
+    }
+    finally {
+        conn.release();
+    }
+};
 const processTelegramUpdates = async () => {
     try {
         await ensureTelegramConfigTable();
@@ -414,10 +544,49 @@ const processTelegramUpdates = async () => {
             const telegramUserId = String(message?.from?.id ?? '').trim();
             const telegramUsername = String(message?.from?.username ?? '').trim() || null;
             const telegramFirstName = String(message?.from?.first_name ?? '').trim() || null;
-            const textRaw = String(message?.text ?? '').trim();
-            if (!chatId || !telegramUserId || !textRaw)
-                continue;
+            const textRaw = String(message?.text ?? message?.caption ?? '').trim();
             const textLower = textRaw.toLowerCase();
+            const sanitizeGroupId = (value) => String(value ?? '').replace(/[^\d-]/g, '').replace(/^-+/, '-').trim();
+            const onlyDigits = (value) => String(value ?? '').replace(/\D/g, '').trim();
+            const trimTelegram100Prefix = (value) => String(value ?? '').replace(/^-100/, '').trim();
+            const configuredGroupIdSanitized = sanitizeGroupId(configuredGroupId);
+            const chatIdSanitized = sanitizeGroupId(chatId);
+            const configuredNo100 = trimTelegram100Prefix(configuredGroupIdSanitized);
+            const chatNo100 = trimTelegram100Prefix(chatIdSanitized);
+            const configuredDigits = onlyDigits(configuredGroupIdSanitized);
+            const chatDigits = onlyDigits(chatIdSanitized);
+            const configuredDigitsNo100 = configuredDigits.startsWith('100')
+                ? configuredDigits.slice(3)
+                : configuredDigits;
+            const chatDigitsNo100 = chatDigits.startsWith('100')
+                ? chatDigits.slice(3)
+                : chatDigits;
+            if (!chatIdSanitized || !telegramUserId)
+                continue;
+            const isGroupMessage = chatType === 'group' || chatType === 'supergroup';
+            const hasConfiguredGroup = Boolean(configuredGroupIdSanitized);
+            const isConfiguredGroupMessage = isGroupMessage &&
+                hasConfiguredGroup &&
+                (chatIdSanitized === configuredGroupIdSanitized ||
+                    chatNo100 === configuredNo100 ||
+                    chatDigits === configuredDigits ||
+                    chatDigitsNo100 === configuredDigitsNo100);
+            console.info('[telegram-group-match]', {
+                chatId,
+                chatIdSanitized,
+                chatNo100,
+                chatDigits,
+                chatDigitsNo100,
+                configuredGroupId,
+                configuredGroupIdSanitized,
+                configuredNo100,
+                configuredDigits,
+                configuredDigitsNo100,
+                chatType,
+                isGroupMessage,
+                isConfiguredGroupMessage,
+                textRaw,
+            });
             if (messageId > 0) {
                 const messageKey = `${chatId}:${messageId}`;
                 if (telegramProcessedMessageKeys.has(messageKey)) {
@@ -430,13 +599,45 @@ const processTelegramUpdates = async () => {
                         telegramProcessedMessageKeys.delete(firstKey);
                 }
             }
-            if (configuredGroupId && chatId === configuredGroupId) {
+            if (isConfiguredGroupMessage) {
+                const normalizedCommandText = textLower.replace(/\s+/g, '');
+                const isCheckinCommand = normalizedCommandText === '/checkin' ||
+                    normalizedCommandText.startsWith('/checkin@');
+                if (!isCheckinCommand) {
+                    continue;
+                }
+                console.info('[telegram-checkin-command]', {
+                    configuredGroupId,
+                    configuredGroupIdSanitized,
+                    chatId,
+                    chatIdSanitized,
+                    telegramUserId,
+                    isConfiguredGroupMessage,
+                });
+                const [connectionRows] = await db_1.default.query(`
+          SELECT user_id AS userId
+          FROM user_telegram_connections
+          WHERE telegram_user_id = ?
+            AND COALESCE(is_connected, 1) = 1
+          ORDER BY id DESC
+          LIMIT 1
+          `, [telegramUserId]);
+                if (connectionRows.length === 0) {
+                    await sendTelegramMessage(botToken, chatId, 'Conta não vinculada. Primeiro envie seu telefone no chat privado do bot para conectar.');
+                    continue;
+                }
+                const linkedUserId = Number(connectionRows[0].userId ?? 0);
+                const claimResult = await claimCheckinForUser(linkedUserId);
+                await sendTelegramMessage(botToken, chatId, claimResult.ok
+                    ? String(claimResult.message ?? '✅ Check-in realizado com sucesso!')
+                    : String(claimResult.error ?? 'Não foi possível processar seu check-in.'));
                 continue;
             }
             if (chatType !== 'private') {
-                await sendTelegramMessage(botToken, chatId, privateChatOnlyMessage);
                 continue;
             }
+            if (!textRaw)
+                continue;
             const isStartCommand = textLower === '/start' || textLower.startsWith('/start@');
             if (isStartCommand) {
                 if (welcomeMessage) {
