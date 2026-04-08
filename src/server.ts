@@ -5304,15 +5304,6 @@ app.post('/api/withdraw/request', async (req, res) => {
       ]
     )
 
-    await conn.query(
-      `
-      UPDATE withdraw_activation_tokens
-      SET status = 'expired', updated_at = NOW()
-      WHERE id = ?
-      `,
-      [activationTokenId]
-    )
-
     await conn.commit()
 
     res.json({
