@@ -1265,6 +1265,101 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 app.use(cors())
 app.use(express.json())
 
+// ─── Referral Commission Levels (priority static routes) ─────────────────────
+app.get('/api/referral/commission-levels/debug', async (req, res) => {
+  const debugRequestInfo = {
+    method: req.method,
+    originalUrl: req.originalUrl,
+    path: req.path,
+    query: req.query,
+    params: req.params,
+    ip: req.ip,
+    forwardedFor: req.headers['x-forwarded-for'],
+    userAgent: req.headers['user-agent'],
+  }
+
+  try {
+    await ensureCommissionLevelsTable()
+    res.setHeader('x-commission-route', 'v2-static-debug')
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `
+    )
+
+    res.json({
+      ok: true,
+      debug: true,
+      database: { dbName: DB_NAME, dbHost: DB_HOST, dbPort: DB_PORT },
+      request: debugRequestInfo,
+      totalLevels: rows.length,
+      rawLevels: rows,
+    })
+  } catch (err) {
+    console.error('[referral-commission-levels-debug-get-priority]', { error: err, request: debugRequestInfo })
+    res.status(500).json({
+      ok: false,
+      error: 'Erro ao carregar debug dos níveis de comissão.',
+      database: { dbName: DB_NAME, dbHost: DB_HOST, dbPort: DB_PORT },
+    })
+  }
+})
+
+app.get('/api/referral/commission-levels', async (req, res) => {
+  const debugRequestInfo = {
+    method: req.method,
+    originalUrl: req.originalUrl,
+    path: req.path,
+    query: req.query,
+    params: req.params,
+    ip: req.ip,
+    forwardedFor: req.headers['x-forwarded-for'],
+    userAgent: req.headers['user-agent'],
+  }
+
+  try {
+    await ensureCommissionLevelsTable()
+    res.setHeader('x-commission-route', 'v2-static')
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE is_active = 1
+      ORDER BY level ASC, id ASC
+      `
+    )
+
+    const levels = rows.map((row) => ({
+      id: Number(row.id),
+      level: Number(row.level ?? 0),
+      name: String(row.name ?? ''),
+      commissionPercent: Number(row.commissionPercent ?? 0),
+      isActive: Number(row.isActive ?? 1) === 1,
+    }))
+
+    res.json({ ok: true, levels, routeVersion: 'v2-static' })
+  } catch (err) {
+    console.error('[referral-commission-levels-get-priority]', { error: err, request: debugRequestInfo })
+    res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' })
+  }
+})
+
 const bootstrapDatabase = async () => {
   await ensureDatabaseExists()
   await ensureTelegramConfigTable()
