@@ -1266,21 +1266,10 @@ app.use(cors())
 app.use(express.json())
 
 // ─── Referral Commission Levels (priority static routes) ─────────────────────
-app.get('/api/referral/commission-levels/debug', async (req, res) => {
-  const debugRequestInfo = {
-    method: req.method,
-    originalUrl: req.originalUrl,
-    path: req.path,
-    query: req.query,
-    params: req.params,
-    ip: req.ip,
-    forwardedFor: req.headers['x-forwarded-for'],
-    userAgent: req.headers['user-agent'],
-  }
-
+app.get('/api/referral/commission-levels/debug', async (_req, res) => {
   try {
     await ensureCommissionLevelsTable()
-    res.setHeader('x-commission-route', 'v2-static-debug')
+    res.setHeader('x-commission-route', 'v4-top-static-debug')
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -1301,35 +1290,19 @@ app.get('/api/referral/commission-levels/debug', async (req, res) => {
       ok: true,
       debug: true,
       database: { dbName: DB_NAME, dbHost: DB_HOST, dbPort: DB_PORT },
-      request: debugRequestInfo,
       totalLevels: rows.length,
       rawLevels: rows,
     })
   } catch (err) {
-    console.error('[referral-commission-levels-debug-get-priority]', { error: err, request: debugRequestInfo })
-    res.status(500).json({
-      ok: false,
-      error: 'Erro ao carregar debug dos níveis de comissão.',
-      database: { dbName: DB_NAME, dbHost: DB_HOST, dbPort: DB_PORT },
-    })
+    console.error('[commission-levels-debug-v4]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar debug dos níveis de comissão.' })
   }
 })
 
-app.get('/api/referral/commission-levels', async (req, res) => {
-  const debugRequestInfo = {
-    method: req.method,
-    originalUrl: req.originalUrl,
-    path: req.path,
-    query: req.query,
-    params: req.params,
-    ip: req.ip,
-    forwardedFor: req.headers['x-forwarded-for'],
-    userAgent: req.headers['user-agent'],
-  }
-
+app.get('/api/referral/commission-levels', async (_req, res) => {
   try {
     await ensureCommissionLevelsTable()
-    res.setHeader('x-commission-route', 'v2-static')
+    res.setHeader('x-commission-route', 'v4-top-static')
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -1353,9 +1326,9 @@ app.get('/api/referral/commission-levels', async (req, res) => {
       isActive: Number(row.isActive ?? 1) === 1,
     }))
 
-    res.json({ ok: true, levels, routeVersion: 'v2-static' })
+    res.json({ ok: true, levels, routeVersion: 'v4-top-static' })
   } catch (err) {
-    console.error('[referral-commission-levels-get-priority]', { error: err, request: debugRequestInfo })
+    console.error('[commission-levels-v4]', err)
     res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' })
   }
 })
