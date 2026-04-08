@@ -998,13 +998,74 @@ const settleExpiredCyclesForUser = async (userId) => {
 };
 app.use((0, cors_1.default)());
 app.use(express_1.default.json());
+// ─── Referral Commission Levels (priority static routes) ─────────────────────
+app.get('/api/referral/commission-levels/debug', async (_req, res) => {
+    try {
+        await ensureCommissionLevelsTable();
+        res.setHeader('x-commission-route', 'v4-top-static-debug');
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `);
+        res.json({
+            ok: true,
+            debug: true,
+            database: { dbName: db_1.DB_NAME, dbHost: db_1.DB_HOST, dbPort: db_1.DB_PORT },
+            totalLevels: rows.length,
+            rawLevels: rows,
+        });
+    }
+    catch (err) {
+        console.error('[commission-levels-debug-v4]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar debug dos níveis de comissão.' });
+    }
+});
+app.get('/api/referral/commission-levels', async (_req, res) => {
+    try {
+        await ensureCommissionLevelsTable();
+        res.setHeader('x-commission-route', 'v4-top-static');
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive
+      FROM commission_levels
+      WHERE is_active = 1
+      ORDER BY level ASC, id ASC
+      `);
+        const levels = rows.map((row) => ({
+            id: Number(row.id),
+            level: Number(row.level ?? 0),
+            name: String(row.name ?? ''),
+            commissionPercent: Number(row.commissionPercent ?? 0),
+            isActive: Number(row.isActive ?? 1) === 1,
+        }));
+        res.json({ ok: true, levels, routeVersion: 'v4-top-static' });
+    }
+    catch (err) {
+        console.error('[commission-levels-v4]', err);
+        res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' });
+    }
+});
 const bootstrapDatabase = async () => {
     await ensureDatabaseExists();
     await ensureTelegramConfigTable();
     await ensureUserTelegramConnectionsTable();
     await ensureTelegramConnectedColumn();
     await ensureTelegramConnectedSync();
+    await ensureCommissionLevelsTable();
     console.log('[bootstrap-database] telegram config e conexões garantidas');
+    console.log('[bootstrap-database] commission_levels table ensured');
 };
 bootstrapDatabase().catch((err) => {
     console.error('[bootstrap-database]', err);
@@ -4796,7 +4857,75 @@ app.post('/api/gift-codes/redeem', async (req, res) => {
         conn.release();
     }
 });
-app.get('/api/referral/commission-levels', async (_req, res) => {
+app.get('/api/referral/commission-levels/debug', async (req, res) => {
+    const debugRequestInfo = {
+        method: req.method,
+        originalUrl: req.originalUrl,
+        path: req.path,
+        query: req.query,
+        params: req.params,
+        ip: req.ip,
+        forwardedFor: req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+    };
+    try {
+        await ensureCommissionLevelsTable();
+        const [rows] = await db_1.default.query(`
+      SELECT
+        id,
+        level,
+        name,
+        commission_percent AS commissionPercent,
+        is_active AS isActive,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM commission_levels
+      ORDER BY level ASC, id ASC
+      `);
+        res.json({
+            ok: true,
+            debug: true,
+            database: {
+                dbName: db_1.DB_NAME,
+                dbHost: db_1.DB_HOST,
+                dbPort: db_1.DB_PORT,
+            },
+            request: debugRequestInfo,
+            totalLevels: rows.length,
+            rawLevels: rows,
+        });
+    }
+    catch (err) {
+        console.error('[referral-commission-levels-debug-get]', {
+            error: err,
+            request: debugRequestInfo,
+            dbName: db_1.DB_NAME,
+            dbHost: db_1.DB_HOST,
+            dbPort: db_1.DB_PORT,
+        });
+        res.status(500).json({
+            ok: false,
+            error: 'Erro ao carregar debug dos níveis de comissão.',
+            database: {
+                dbName: db_1.DB_NAME,
+                dbHost: db_1.DB_HOST,
+                dbPort: db_1.DB_PORT,
+            },
+        });
+    }
+});
+app.get('/api/referral/commission-levels', async (req, res) => {
+    const debugRequestInfo = {
+        method: req.method,
+        originalUrl: req.originalUrl,
+        path: req.path,
+        query: req.query,
+        params: req.params,
+        ip: req.ip,
+        forwardedFor: req.headers['x-forwarded-for'],
+        userAgent: req.headers['user-agent'],
+    };
+    console.info('[referral-commission-levels-request]', debugRequestInfo);
     try {
         await ensureCommissionLevelsTable();
         const [rows] = await db_1.default.query(`
@@ -4817,11 +4946,21 @@ app.get('/api/referral/commission-levels', async (_req, res) => {
             commissionPercent: Number(row.commissionPercent ?? 0),
             isActive: Number(row.isActive ?? 1) === 1,
         }));
+        console.info('[referral-commission-levels-response]', {
+            ok: true,
+            totalLevels: levels.length,
+            levelsPreview: levels.slice(0, 3),
+            requestPath: req.path,
+            requestOriginalUrl: req.originalUrl,
+        });
         res.json({ ok: true, levels });
     }
     catch (err) {
-        console.error('[referral-commission-levels-get]', err);
-        res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão para convite.' });
+        console.error('[referral-commission-levels-get]', {
+            error: err,
+            request: debugRequestInfo,
+        });
+        res.status(500).json({ ok: false, error: 'Erro ao carregar níveis de comissão.' });
     }
 });
 app.get('/api/admin/commission-levels', requireMaxAdmin, async (_req, res) => {

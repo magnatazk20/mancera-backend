@@ -7,7 +7,7 @@ exports.DB_NAME = exports.DB_PASSWORD = exports.DB_USER = exports.DB_PORT = expo
 const promise_1 = __importDefault(require("mysql2/promise"));
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
-exports.DB_HOST = process.env.DB_HOST ?? 'localhost';
+exports.DB_HOST = process.env.DB_HOST ?? '127.0.0.1';
 exports.DB_PORT = Number(process.env.DB_PORT ?? 3306);
 exports.DB_USER = process.env.DB_USER ?? 'root';
 exports.DB_PASSWORD = process.env.DB_PASSWORD ?? '';
