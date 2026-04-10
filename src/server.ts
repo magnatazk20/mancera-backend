@@ -5067,6 +5067,25 @@ app.post('/api/withdraw/request', async (req, res) => {
       return
     }
 
+    const [todayPaidRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT id
+      FROM withdrawals
+      WHERE user_id = ?
+        AND DATE(created_at) = CURDATE()
+        AND LOWER(status) IN ('paid', 'payment.paid')
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [parsedUserId]
+    )
+
+    if (todayPaidRows.length > 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Você já realizou um saque pago hoje. Tente novamente amanhã.' })
+      return
+    }
+
     const [pixRows] = await conn.query<RowDataPacket[]>(
       `
       SELECT
