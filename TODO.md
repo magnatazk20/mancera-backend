@@ -1,11 +1,9 @@
-# TODO - Fix persistência de dias/horários em /adf/withdraw-config
-
-- [x] Atualizar schema de `system_withdraw_config` para incluir:
-  - `withdraw_start_time`
-  - `withdraw_end_time`
-  - `withdraw_allowed_days`
-- [x] Atualizar GET `/api/admin/withdraw-config` para retornar esses campos
-- [x] Atualizar POST `/api/admin/withdraw-config` para validar e salvar esses campos
-- [x] Executar validação rápida (build) no backend
-- [x] Atualizar checklist final
+- [x] Ajustar POST /api/admin/withdraw-config para persistir withdraw_start_time, withdraw_end_time e withdraw_allowed_days
+- [x] Adicionar ALTER TABLE das colunas de janela de saque no POST /api/admin/withdraw-config
+- [x] Retornar os novos campos na resposta do POST /api/admin/withdraw-config
+- [x] Aplicar validação de dia/horário permitido no endpoint POST /api/withdraw/request
+- [ ] Frontend /saque: exibir status de disponibilidade por dia/horário conforme config
+- [ ] Frontend /saque: bloquear envio fora da janela com mensagem amigável
+- [ ] Frontend /saque: exibir horário início/fim e dias permitidos configurados
+- [ ] Build frontend para validar TypeScript
 - [ ] Commit e push das alterações

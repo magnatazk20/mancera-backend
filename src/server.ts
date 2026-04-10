@@ -5143,6 +5143,9 @@ app.post('/api/withdraw/request', async (req, res) => {
         min_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         max_withdraw_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
         withdraw_auto_approve TINYINT(1) NOT NULL DEFAULT 0,
+        withdraw_start_time CHAR(5) NOT NULL DEFAULT '00:00',
+        withdraw_end_time CHAR(5) NOT NULL DEFAULT '23:59',
+        withdraw_allowed_days VARCHAR(32) NOT NULL DEFAULT '0,1,2,3,4,5,6',
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (id)
@@ -5161,11 +5164,47 @@ app.post('/api/withdraw/request', async (req, res) => {
       // coluna já existe
     }
 
+    try {
+      await conn.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_start_time CHAR(5) NOT NULL DEFAULT '00:00'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await conn.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_end_time CHAR(5) NOT NULL DEFAULT '23:59'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await conn.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_allowed_days VARCHAR(32) NOT NULL DEFAULT '0,1,2,3,4,5,6'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [configRows] = await conn.query<RowDataPacket[]>(
       `
       SELECT
         withdraw_auto_approve AS withdrawAutoApprove,
-        withdraw_fee_percent AS withdrawFeePercent
+        withdraw_fee_percent AS withdrawFeePercent,
+        withdraw_start_time AS withdrawStartTime,
+        withdraw_end_time AS withdrawEndTime,
+        withdraw_allowed_days AS withdrawAllowedDays
       FROM system_withdraw_config
       ORDER BY id ASC
       LIMIT 1
@@ -5174,9 +5213,60 @@ app.post('/api/withdraw/request', async (req, res) => {
 
     const shouldAutoApprove = Number(configRows[0]?.withdrawAutoApprove ?? 0) === 1
     const withdrawFeePercentRaw = Number(configRows[0]?.withdrawFeePercent ?? 0)
+    const withdrawStartTime = String(configRows[0]?.withdrawStartTime ?? '00:00').trim()
+    const withdrawEndTime = String(configRows[0]?.withdrawEndTime ?? '23:59').trim()
+    const allowedDaysSet = new Set(
+      String(configRows[0]?.withdrawAllowedDays ?? '0,1,2,3,4,5,6')
+        .split(',')
+        .map((item) => Number(item.trim()))
+        .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+    )
     const withdrawFeePercent = Number.isFinite(withdrawFeePercentRaw)
       ? Math.max(0, withdrawFeePercentRaw)
       : 0
+
+    const nowInSaoPaulo = new Date(
+      new Date().toLocaleString('en-US', { timeZone: SAO_PAULO_TZ })
+    )
+    const currentWeekDay = nowInSaoPaulo.getDay()
+    const currentMinutes = nowInSaoPaulo.getHours() * 60 + nowInSaoPaulo.getMinutes()
+
+    const parseTimeToMinutes = (timeValue: string) => {
+      const [hh, mm] = String(timeValue ?? '').split(':').map((v) => Number(v))
+      if (!Number.isInteger(hh) || !Number.isInteger(mm)) return null
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null
+      return hh * 60 + mm
+    }
+
+    const startMinutes = parseTimeToMinutes(withdrawStartTime)
+    const endMinutes = parseTimeToMinutes(withdrawEndTime)
+
+    if (
+      startMinutes == null ||
+      endMinutes == null ||
+      !allowedDaysSet.has(currentWeekDay)
+    ) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: 'Saque indisponível no momento conforme a configuração de dia/horário.',
+      })
+      return
+    }
+
+    const isWithinWindow =
+      startMinutes <= endMinutes
+        ? currentMinutes >= startMinutes && currentMinutes <= endMinutes
+        : currentMinutes >= startMinutes || currentMinutes <= endMinutes
+
+    if (!isWithinWindow) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: `Saque permitido apenas entre ${withdrawStartTime} e ${withdrawEndTime} (horário de São Paulo).`,
+      })
+      return
+    }
 
     const feeAmount = Number((parsedAmount * (withdrawFeePercent / 100)).toFixed(2))
     const netAmount = Number((parsedAmount - feeAmount).toFixed(2))
@@ -7609,6 +7699,39 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
       // coluna já existe
     }
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_start_time CHAR(5) NOT NULL DEFAULT '00:00'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_end_time CHAR(5) NOT NULL DEFAULT '23:59'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_allowed_days VARCHAR(32) NOT NULL DEFAULT '0,1,2,3,4,5,6'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -7616,7 +7739,10 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         withdraw_fee_percent AS withdrawFeePercent,
         min_withdraw_amount AS minWithdrawAmount,
         max_withdraw_amount AS maxWithdrawAmount,
-        withdraw_auto_approve AS withdrawAutoApprove
+        withdraw_auto_approve AS withdrawAutoApprove,
+        withdraw_start_time AS withdrawStartTime,
+        withdraw_end_time AS withdrawEndTime,
+        withdraw_allowed_days AS withdrawAllowedDays
       FROM system_withdraw_config
       ORDER BY id ASC
       LIMIT 1
@@ -7627,8 +7753,16 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
       await pool.query(
         `
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
-        VALUES (0.00, 0.00, 0.00, 0)
+          (
+            withdraw_fee_percent,
+            min_withdraw_amount,
+            max_withdraw_amount,
+            withdraw_auto_approve,
+            withdraw_start_time,
+            withdraw_end_time,
+            withdraw_allowed_days
+          )
+        VALUES (0.00, 0.00, 0.00, 0, '00:00', '23:59', '0,1,2,3,4,5,6')
         `
       )
 
@@ -7639,6 +7773,9 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
           minWithdrawAmount: 0,
           maxWithdrawAmount: 0,
           withdrawAutoApprove: false,
+          withdrawStartTime: '00:00',
+          withdrawEndTime: '23:59',
+          withdrawAllowedDays: '0,1,2,3,4,5,6',
         },
       })
       return
@@ -7652,6 +7789,9 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
         minWithdrawAmount: Number(row.minWithdrawAmount ?? 0),
         maxWithdrawAmount: Number(row.maxWithdrawAmount ?? 0),
         withdrawAutoApprove: Number(row.withdrawAutoApprove ?? 0) === 1,
+        withdrawStartTime: String(row.withdrawStartTime ?? '00:00'),
+        withdrawEndTime: String(row.withdrawEndTime ?? '23:59'),
+        withdrawAllowedDays: String(row.withdrawAllowedDays ?? '0,1,2,3,4,5,6'),
       },
     })
   } catch (err) {
@@ -7661,16 +7801,26 @@ app.get('/api/admin/withdraw-config', async (_req, res) => {
 })
 
 app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
-  const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount, withdrawAutoApprove } = req.body as {
+  const { withdrawFeePercent, minWithdrawAmount, maxWithdrawAmount, withdrawAutoApprove, withdrawStartTime, withdrawEndTime, withdrawAllowedDays } = req.body as {
     withdrawFeePercent?: number | string
     minWithdrawAmount?: number | string
     maxWithdrawAmount?: number | string
     withdrawAutoApprove?: boolean | number | string
+    withdrawStartTime?: string
+    withdrawEndTime?: string
+    withdrawAllowedDays?: string
   }
 
   const fee = Number(String(withdrawFeePercent ?? 0).replace(',', '.'))
   const min = Number(String(minWithdrawAmount ?? 0).replace(',', '.'))
   const max = Number(String(maxWithdrawAmount ?? 0).replace(',', '.'))
+  const start = String(withdrawStartTime ?? '00:00').trim()
+  const end = String(withdrawEndTime ?? '23:59').trim()
+  const allowedDays = String(withdrawAllowedDays ?? '0,1,2,3,4,5,6')
+    .split(',')
+    .map((day) => Number(day.trim()))
+    .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+  const normalizedAllowedDays = [...new Set(allowedDays)].sort((a, b) => a - b).join(',')
   const autoApprove =
     withdrawAutoApprove === true ||
     withdrawAutoApprove === 1 ||
@@ -7695,6 +7845,17 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
 
   if (max > 0 && min > max) {
     res.status(400).json({ ok: false, error: 'Valor mínimo não pode ser maior que o máximo.' })
+    return
+  }
+
+  const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/
+  if (!timeRegex.test(start) || !timeRegex.test(end)) {
+    res.status(400).json({ ok: false, error: 'Horário inválido. Use o formato HH:MM.' })
+    return
+  }
+
+  if (!normalizedAllowedDays) {
+    res.status(400).json({ ok: false, error: 'Selecione ao menos um dia permitido para saque.' })
     return
   }
 
@@ -7725,6 +7886,39 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
       // coluna já existe
     }
 
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_start_time CHAR(5) NOT NULL DEFAULT '00:00'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_end_time CHAR(5) NOT NULL DEFAULT '23:59'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
+    try {
+      await pool.query(
+        `
+        ALTER TABLE system_withdraw_config
+        ADD COLUMN withdraw_allowed_days VARCHAR(32) NOT NULL DEFAULT '0,1,2,3,4,5,6'
+        `
+      )
+    } catch {
+      // coluna já existe
+    }
+
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM system_withdraw_config ORDER BY id ASC LIMIT 1'
     )
@@ -7737,10 +7931,18 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
       await pool.query(
         `
         INSERT INTO system_withdraw_config
-          (withdraw_fee_percent, min_withdraw_amount, max_withdraw_amount, withdraw_auto_approve)
-        VALUES (?, ?, ?, ?)
+          (
+            withdraw_fee_percent,
+            min_withdraw_amount,
+            max_withdraw_amount,
+            withdraw_auto_approve,
+            withdraw_start_time,
+            withdraw_end_time,
+            withdraw_allowed_days
+          )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         `,
-        [normalizedFee, normalizedMin, normalizedMax, autoApprove]
+        [normalizedFee, normalizedMin, normalizedMax, autoApprove, start, end, normalizedAllowedDays]
       )
     } else {
       await pool.query(
@@ -7751,10 +7953,13 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
           min_withdraw_amount = ?,
           max_withdraw_amount = ?,
           withdraw_auto_approve = ?,
+          withdraw_start_time = ?,
+          withdraw_end_time = ?,
+          withdraw_allowed_days = ?,
           updated_at = NOW()
         WHERE id = ?
         `,
-        [normalizedFee, normalizedMin, normalizedMax, autoApprove, Number(rows[0].id)]
+        [normalizedFee, normalizedMin, normalizedMax, autoApprove, start, end, normalizedAllowedDays, Number(rows[0].id)]
       )
     }
 
@@ -7766,6 +7971,9 @@ app.post('/api/admin/withdraw-config', requireMaxAdmin, async (req, res) => {
         minWithdrawAmount: normalizedMin,
         maxWithdrawAmount: normalizedMax,
         withdrawAutoApprove: autoApprove === 1,
+        withdrawStartTime: start,
+        withdrawEndTime: end,
+        withdrawAllowedDays: normalizedAllowedDays,
       },
     })
   } catch (err) {
