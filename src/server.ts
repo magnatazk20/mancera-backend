@@ -1471,6 +1471,8 @@ const settleExpiredCyclesForUser = async (userId: number) => {
             purchaseIds,
             completedCount: purchaseIds.length,
             totalProfit: Number(totalProfit.toFixed(2)),
+            previousBalance: Number(oldBalance.toFixed(2)),
+            currentBalance: Number(newBalance.toFixed(2)),
           }),
         ]
       )
