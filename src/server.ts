@@ -2194,7 +2194,7 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
 
     const [userRows] = await conn.query<RowDataPacket[]>(
       `
-      SELECT id
+      SELECT id, monthly_salary_contract AS monthlySalaryContract
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -2299,6 +2299,13 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
     }
 
     const contractLabel = `Contrato: ${String(plan.title ?? 'Start V1').trim() || 'Start V1'}`
+    const currentContract = String(userRows[0]?.monthlySalaryContract ?? '').trim()
+
+    if (currentContract && currentContract === contractLabel) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Este plano já foi obtido anteriormente.' })
+      return
+    }
 
     await conn.query(
       `
