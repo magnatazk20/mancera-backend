@@ -2251,6 +2251,11 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
     }
 
     const plan = planRows[0]
+    const monthlySalaryAmount = Number(plan.monthlySalary ?? 0)
+    const monthlySalaryFormatted = monthlySalaryAmount.toLocaleString('pt-BR', {
+      style: 'currency',
+      currency: 'BRL',
+    })
     const requiredL1 = Number(plan.requiredLevel1Deposited ?? 0)
     const requiredL2 = Number(plan.requiredLevel2Deposited ?? 0)
     const requiredL3 = Number(plan.requiredLevel3Deposited ?? 0)
@@ -2364,7 +2369,7 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
 
 Parabéns ao usuário Telefone: ${maskedPhone} por ter sido promovido a Promotor ${contractLabel}
 
-Agora ele receberá um salario mensal de R$100,00 em sua conta creditado todos os meses.
+Agora ele receberá um salario mensal de ${monthlySalaryFormatted} em sua conta creditado todos os meses.
 
 💡 Ao convidar amigos para se cadastrar e operar na plataforma, você não só ganha generosas recompensas em dinheiro por promoção, como também recebe comissões permanentes sobre taxas e ganhos de suas subcontas.`
 
