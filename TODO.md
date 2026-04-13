@@ -1,9 +1,3 @@
-- [x] Ajustar POST /api/admin/withdraw-config para persistir withdraw_start_time, withdraw_end_time e withdraw_allowed_days
-- [x] Adicionar ALTER TABLE das colunas de janela de saque no POST /api/admin/withdraw-config
-- [x] Retornar os novos campos na resposta do POST /api/admin/withdraw-config
-- [x] Aplicar validação de dia/horário permitido no endpoint POST /api/withdraw/request
-- [ ] Frontend /saque: exibir status de disponibilidade por dia/horário conforme config
-- [ ] Frontend /saque: bloquear envio fora da janela com mensagem amigável
-- [ ] Frontend /saque: exibir horário início/fim e dias permitidos configurados
-- [ ] Build frontend para validar TypeScript
-- [ ] Commit e push das alterações
+- [x] Adicionar migração defensiva da tabela `monthly_salary_plans` para garantir coluna `image_url` e colunas relacionadas.
+- [x] Validar compilação do backend após ajuste.
+- [ ] Commitar e enviar (push) as alterações.

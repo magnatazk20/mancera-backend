@@ -2170,6 +2170,7 @@ app.get('/api/monthly-salary-plans', async (_req, res) => {
       SELECT
         id,
         title,
+        image_url AS imageUrl,
         monthly_salary AS monthlySalary,
         required_level1_deposited AS requiredLevel1Deposited,
         required_level2_deposited AS requiredLevel2Deposited,
@@ -2185,6 +2186,7 @@ app.get('/api/monthly-salary-plans', async (_req, res) => {
     const plans = rows.map((row) => ({
       id: Number(row.id),
       title: String(row.title ?? ''),
+      imageUrl: String(row.imageUrl ?? ''),
       monthlySalary: Number(row.monthlySalary ?? 0),
       requiredLevel1Deposited: Number(row.requiredLevel1Deposited ?? 0),
       requiredLevel2Deposited: Number(row.requiredLevel2Deposited ?? 0),
@@ -2209,6 +2211,7 @@ app.get('/api/admin/monthly-salary-plans', requireMaxAdmin, async (_req, res) =>
       SELECT
         id,
         title,
+        image_url AS imageUrl,
         monthly_salary AS monthlySalary,
         required_level1_deposited AS requiredLevel1Deposited,
         required_level2_deposited AS requiredLevel2Deposited,
@@ -2223,6 +2226,7 @@ app.get('/api/admin/monthly-salary-plans', requireMaxAdmin, async (_req, res) =>
     const plans = rows.map((row) => ({
       id: Number(row.id),
       title: String(row.title ?? ''),
+      imageUrl: String(row.imageUrl ?? ''),
       monthlySalary: Number(row.monthlySalary ?? 0),
       requiredLevel1Deposited: Number(row.requiredLevel1Deposited ?? 0),
       requiredLevel2Deposited: Number(row.requiredLevel2Deposited ?? 0),
@@ -2241,6 +2245,7 @@ app.get('/api/admin/monthly-salary-plans', requireMaxAdmin, async (_req, res) =>
 app.post('/api/admin/monthly-salary-plans', requireMaxAdmin, async (req, res) => {
   const {
     title,
+    imageUrl,
     monthlySalary,
     requiredLevel1Deposited,
     requiredLevel2Deposited,
@@ -2249,6 +2254,7 @@ app.post('/api/admin/monthly-salary-plans', requireMaxAdmin, async (req, res) =>
     sortOrder,
   } = req.body as {
     title?: string
+    imageUrl?: string
     monthlySalary?: number | string
     requiredLevel1Deposited?: number | string
     requiredLevel2Deposited?: number | string
@@ -2258,6 +2264,7 @@ app.post('/api/admin/monthly-salary-plans', requireMaxAdmin, async (req, res) =>
   }
 
   const parsedTitle = String(title ?? '').trim()
+  const parsedImageUrl = String(imageUrl ?? '').trim()
   const parsedMonthlySalary = Number(String(monthlySalary ?? '').replace(',', '.'))
   const parsedL1 = Number(String(requiredLevel1Deposited ?? 0))
   const parsedL2 = Number(String(requiredLevel2Deposited ?? 0))
@@ -2294,6 +2301,7 @@ app.post('/api/admin/monthly-salary-plans', requireMaxAdmin, async (req, res) =>
       INSERT INTO monthly_salary_plans
       (
         title,
+        image_url,
         monthly_salary,
         required_level1_deposited,
         required_level2_deposited,
@@ -2305,6 +2313,7 @@ app.post('/api/admin/monthly-salary-plans', requireMaxAdmin, async (req, res) =>
       `,
       [
         parsedTitle,
+        parsedImageUrl || null,
         Number(parsedMonthlySalary.toFixed(2)),
         parsedL1,
         parsedL2,
@@ -2332,6 +2341,7 @@ app.put('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, res)
   const planId = Number(req.params.id)
   const {
     title,
+    imageUrl,
     monthlySalary,
     requiredLevel1Deposited,
     requiredLevel2Deposited,
@@ -2340,6 +2350,7 @@ app.put('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, res)
     sortOrder,
   } = req.body as {
     title?: string
+    imageUrl?: string
     monthlySalary?: number | string
     requiredLevel1Deposited?: number | string
     requiredLevel2Deposited?: number | string
@@ -2354,6 +2365,7 @@ app.put('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, res)
   }
 
   const parsedTitle = String(title ?? '').trim()
+  const parsedImageUrl = String(imageUrl ?? '').trim()
   const parsedMonthlySalary = Number(String(monthlySalary ?? '').replace(',', '.'))
   const parsedL1 = Number(String(requiredLevel1Deposited ?? 0))
   const parsedL2 = Number(String(requiredLevel2Deposited ?? 0))
@@ -2390,6 +2402,7 @@ app.put('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, res)
       UPDATE monthly_salary_plans
       SET
         title = ?,
+        image_url = ?,
         monthly_salary = ?,
         required_level1_deposited = ?,
         required_level2_deposited = ?,
@@ -2401,6 +2414,7 @@ app.put('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, res)
       `,
       [
         parsedTitle,
+        parsedImageUrl || null,
         Number(parsedMonthlySalary.toFixed(2)),
         parsedL1,
         parsedL2,
@@ -6654,6 +6668,7 @@ const ensureMonthlySalaryPlansTable = async () => {
     CREATE TABLE IF NOT EXISTS monthly_salary_plans (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       title VARCHAR(150) NOT NULL,
+      image_url VARCHAR(500) NULL,
       monthly_salary DECIMAL(12,2) NOT NULL DEFAULT 0.00,
       required_level1_deposited INT NOT NULL DEFAULT 0,
       required_level2_deposited INT NOT NULL DEFAULT 0,
@@ -6668,6 +6683,69 @@ const ensureMonthlySalaryPlansTable = async () => {
     )
     `
   )
+
+  const tryAlter = async (sql: string) => {
+    try {
+      await pool.query(sql)
+    } catch {
+      // coluna/índice já existe ou não precisa alterar
+    }
+  }
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN image_url VARCHAR(500) NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN monthly_salary DECIMAL(12,2) NOT NULL DEFAULT 0.00
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN required_level1_deposited INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN required_level2_deposited INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN required_level3_deposited INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN sort_order INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD KEY idx_monthly_salary_plans_active (is_active)
+  `)
+
+  await tryAlter(`
+    ALTER TABLE monthly_salary_plans
+    ADD KEY idx_monthly_salary_plans_sort (sort_order)
+  `)
 
   const [countRows] = await pool.query<RowDataPacket[]>(
     `
