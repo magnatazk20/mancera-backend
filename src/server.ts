@@ -1652,6 +1652,155 @@ const ensureRouletteCodesTable = async () => {
   )
 }
 
+const DEFAULT_ROULETTE_PROBABILITIES: Array<{ label: string; percent: number; sortOrder: number }> = [
+  { label: '1 BRL', percent: 40, sortOrder: 0 },
+  { label: '16 BRL', percent: 20, sortOrder: 1 },
+  { label: '35 BRL', percent: 14, sortOrder: 2 },
+  { label: '50 BRL', percent: 10, sortOrder: 3 },
+  { label: '73 BRL', percent: 8, sortOrder: 4 },
+  { label: '90 BRL', percent: 5, sortOrder: 5 },
+  { label: '183 BRL', percent: 2, sortOrder: 6 },
+  { label: '16600 BRL', percent: 1, sortOrder: 7 },
+]
+
+const ensureRouletteProbabilitiesTable = async () => {
+  await pool.query(
+    `
+    CREATE TABLE IF NOT EXISTS roulette_probabilities (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      label VARCHAR(120) NOT NULL,
+      percent DECIMAL(8,4) NOT NULL DEFAULT 0.0000,
+      sort_order INT NOT NULL DEFAULT 0,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_roulette_probabilities_label (label),
+      KEY idx_roulette_probabilities_sort_order (sort_order)
+    )
+    `
+  )
+
+  for (const item of DEFAULT_ROULETTE_PROBABILITIES) {
+    await pool.query(
+      `
+      INSERT INTO roulette_probabilities (label, percent, sort_order)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        sort_order = VALUES(sort_order),
+        updated_at = NOW()
+      `,
+      [item.label, Number(item.percent.toFixed(4)), item.sortOrder]
+    )
+  }
+}
+
+app.get('/api/admin/roulette-probabilities', requireMaxAdmin, async (_req: AuthenticatedRequest, res) => {
+  try {
+    await ensureRouletteProbabilitiesTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        label,
+        percent,
+        sort_order AS sortOrder
+      FROM roulette_probabilities
+      ORDER BY sort_order ASC, id ASC
+      `
+    )
+
+    const probabilities = rows.map((row) => ({
+      label: String(row.label ?? ''),
+      percent: Number(row.percent ?? 0),
+      sortOrder: Number(row.sortOrder ?? 0),
+    }))
+
+    res.json({ ok: true, probabilities })
+  } catch (err) {
+    console.error('[admin-roulette-probabilities-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar probabilidades da roleta.' })
+  }
+})
+
+app.put('/api/admin/roulette-probabilities', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const payload = req.body as {
+    probabilities?: Array<{ label?: string; percent?: number | string }>
+  }
+
+  const list = Array.isArray(payload?.probabilities) ? payload.probabilities : []
+  if (list.length === 0) {
+    res.status(400).json({ ok: false, error: 'Informe a lista de probabilidades.' })
+    return
+  }
+
+  const normalized = list.map((item, index) => ({
+    label: String(item?.label ?? '').trim(),
+    percent: Number(String(item?.percent ?? '').replace(',', '.')),
+    sortOrder: index,
+  }))
+
+  if (normalized.some((item) => !item.label)) {
+    res.status(400).json({ ok: false, error: 'Cada item deve possuir label.' })
+    return
+  }
+
+  if (normalized.some((item) => !Number.isFinite(item.percent) || item.percent < 0)) {
+    res.status(400).json({ ok: false, error: 'Todos os percentuais devem ser números válidos >= 0.' })
+    return
+  }
+
+  const total = normalized.reduce((acc, item) => acc + item.percent, 0)
+  if (Math.abs(total - 100) > 0.0001) {
+    res.status(400).json({
+      ok: false,
+      error: `A soma dos percentuais deve ser 100%. Soma atual: ${total.toFixed(4)}%.`,
+    })
+    return
+  }
+
+  const uniqueLabels = new Set(normalized.map((item) => item.label.toLowerCase()))
+  if (uniqueLabels.size !== normalized.length) {
+    res.status(400).json({ ok: false, error: 'Não é permitido repetir labels na configuração.' })
+    return
+  }
+
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+    await ensureRouletteProbabilitiesTable()
+
+    await conn.query('DELETE FROM roulette_probabilities')
+
+    for (const item of normalized) {
+      await conn.query(
+        `
+        INSERT INTO roulette_probabilities (label, percent, sort_order)
+        VALUES (?, ?, ?)
+        `,
+        [item.label, Number(item.percent.toFixed(4)), item.sortOrder]
+      )
+    }
+
+    await conn.commit()
+
+    res.json({
+      ok: true,
+      message: 'Probabilidades salvas com sucesso.',
+      probabilities: normalized.map((item) => ({
+        label: item.label,
+        percent: Number(item.percent.toFixed(4)),
+        sortOrder: item.sortOrder,
+      })),
+    })
+  } catch (err) {
+    await conn.rollback()
+    console.error('[admin-roulette-probabilities-put]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao salvar probabilidades da roleta.' })
+  } finally {
+    conn.release()
+  }
+})
+
 app.get('/api/admin/roulette-codes', requireMaxAdmin, async (_req: AuthenticatedRequest, res) => {
   try {
     await ensureRouletteCodesTable()
