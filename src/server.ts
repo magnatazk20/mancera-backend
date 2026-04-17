@@ -287,6 +287,17 @@ const ensureTelegramConfigTable = async () => {
     // coluna já existe
   }
 
+  try {
+    await pool.query(
+      `
+      ALTER TABLE system_telegram_config
+      ADD COLUMN logs_group_id VARCHAR(255) NOT NULL DEFAULT ''
+      `
+    )
+  } catch {
+    // coluna já existe
+  }
+
   await pool.query(
     `
     INSERT IGNORE INTO system_telegram_config (
@@ -502,6 +513,25 @@ const sendTelegramMessage = async (
     })
   } catch (err) {
     console.error('[telegram-send-message]', err)
+  }
+}
+
+// Envia mensagem para o grupo de logs configurado no banco
+const sendTelegramLog = async (text: string) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT bot_token AS botToken, logs_group_id AS logsGroupId
+       FROM system_telegram_config
+       WHERE TRIM(bot_token) <> '' AND TRIM(COALESCE(logs_group_id,'')) <> ''
+       LIMIT 1`
+    )
+    if (!rows.length) return
+    const botToken = String(rows[0].botToken ?? '')
+    const logsGroupId = String(rows[0].logsGroupId ?? '')
+    if (!botToken || !logsGroupId) return
+    await sendTelegramMessage(botToken, logsGroupId, text, { parseMode: 'HTML' })
+  } catch (err) {
+    console.error('[telegram-log]', err)
   }
 }
 
@@ -1370,7 +1400,7 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 
     const [expiredRows] = await conn.query<RowDataPacket[]>(
       `
-      SELECT id, expected_profit AS expectedProfit
+      SELECT id, expected_profit AS expectedProfit, amount_paid AS amountPaid
       FROM user_cycle_purchases
       WHERE user_id = ?
         AND status = 'active'
@@ -1397,25 +1427,31 @@ const settleExpiredCyclesForUser = async (userId: number) => {
     }
 
     let totalProfit = 0
+    let totalCapitalReturn = 0
     const purchaseIds: number[] = []
 
     for (const row of expiredRows) {
       const purchaseId = Number(row.id)
       const profit = Number(row.expectedProfit ?? 0)
+      const capital = Number(row.amountPaid ?? 0)
       if (purchaseId > 0) purchaseIds.push(purchaseId)
       if (profit > 0) totalProfit += profit
+      if (capital > 0) totalCapitalReturn += capital
     }
+
+    // Total a creditar = lucro + devolução do capital investido
+    const totalCredit = Number((totalProfit + totalCapitalReturn).toFixed(2))
 
     const oldBalance = Number(userRows[0].balance ?? 0)
 
-    if (totalProfit > 0) {
+    if (totalCredit > 0) {
       await conn.query(
         `
         UPDATE users
         SET balance = COALESCE(balance, 0) + ?
         WHERE id = ?
         `,
-        [Number(totalProfit.toFixed(2)), userId]
+        [totalCredit, userId]
       )
     }
 
@@ -1440,7 +1476,7 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 
     const newBalance = Number(updatedRows[0]?.balance ?? oldBalance)
 
-    if (purchaseIds.length > 0 && totalProfit > 0) {
+    if (purchaseIds.length > 0 && totalCredit > 0) {
       await conn.query(
         `
         CREATE TABLE IF NOT EXISTS logs (
@@ -1488,11 +1524,13 @@ const settleExpiredCyclesForUser = async (userId: number) => {
           'cycle_investment_completed_auto_credit',
           Number(oldBalance.toFixed(2)),
           Number(newBalance.toFixed(2)),
-          Number(totalProfit.toFixed(2)),
+          totalCredit,
           JSON.stringify({
             purchaseIds,
             completedCount: purchaseIds.length,
             totalProfit: Number(totalProfit.toFixed(2)),
+            totalCapitalReturn: Number(totalCapitalReturn.toFixed(2)),
+            totalCredit,
             previousBalance: Number(oldBalance.toFixed(2)),
             currentBalance: Number(newBalance.toFixed(2)),
           }),
@@ -1511,6 +1549,146 @@ const settleExpiredCyclesForUser = async (userId: number) => {
 
 app.use(cors())
 app.use(express.json())
+
+// ─── Headers de segurança HTTP ───────────────────────────────────────────────
+app.use((_req, res, next) => {
+  // Impede carregamento em iframes (clickjacking)
+  res.setHeader('X-Frame-Options', 'DENY')
+  // Impede sniffing de content-type
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  // Força HTTPS em browsers modernos (1 ano)
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  // Bloqueia scripts/recursos não autorizados (XSS)
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none';"
+  )
+  // Esconde tecnologia do servidor
+  res.removeHeader('X-Powered-By')
+  next()
+})
+
+// ─── Rate Limiter em memória ──────────────────────────────────────────────────
+interface RateLimitEntry {
+  count: number
+  resetAt: number
+}
+const rateLimitStore = new Map<string, RateLimitEntry>()
+
+// Limpa entradas expiradas a cada 5 minutos para evitar vazamento de memória
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, entry] of rateLimitStore.entries()) {
+    if (now > entry.resetAt) rateLimitStore.delete(key)
+  }
+}, 5 * 60 * 1000)
+
+const createRateLimiter = (maxRequests: number, windowMs: number, message?: string) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const ip = String(req.ip ?? req.socket?.remoteAddress ?? 'unknown')
+    const key = `${ip}:${req.path}`
+    const now = Date.now()
+    const entry = rateLimitStore.get(key)
+
+    if (!entry || now > entry.resetAt) {
+      rateLimitStore.set(key, { count: 1, resetAt: now + windowMs })
+      next()
+      return
+    }
+
+    entry.count += 1
+
+    if (entry.count > maxRequests) {
+      const retryAfterSec = Math.ceil((entry.resetAt - now) / 1000)
+      res.setHeader('Retry-After', String(retryAfterSec))
+      res.status(429).json({
+        ok: false,
+        error: message ?? 'Muitas requisições. Aguarde alguns segundos e tente novamente.',
+      })
+      return
+    }
+
+    next()
+  }
+}
+
+// Limitadores específicos por rota
+const redeemCodeLimiter = createRateLimiter(5, 60_000, 'Limite de resgates atingido. Aguarde 1 minuto.')
+const spinLimiter = createRateLimiter(10, 60_000, 'Limite de giros atingido. Aguarde 1 minuto.')
+const authLimiter = createRateLimiter(10, 60_000, 'Muitas tentativas de login. Aguarde 1 minuto.')
+const generalApiLimiter = createRateLimiter(120, 60_000)
+
+// ─── Presença online em tempo real (WebSocket + heartbeat HTTP) ──────────────
+// Mapa: chave (userId ou sessionKey) → timestamp do último ping (ms)
+const onlinePresence = new Map<string, number>()
+const PRESENCE_TTL_MS = 65_000 // 65s — heartbeat a cada 30s, expiração com margem
+
+// Helper: conta entradas ativas e emite via WebSocket para todos (count + lista de IDs)
+const broadcastOnlineCount = () => {
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  let count = 0
+  const onlineUserIds: number[] = []
+  for (const [key, ts] of onlinePresence.entries()) {
+    if (ts >= cutoff) {
+      count++
+      const num = Number(key)
+      if (!isNaN(num) && num > 0) onlineUserIds.push(num)
+    }
+  }
+  io.emit('online-count', { onlineCount: count, onlineUserIds })
+  return count
+}
+
+// Limpa entradas expiradas a cada 30 segundos e broadcast o novo count
+setInterval(() => {
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  let changed = false
+  for (const [key, ts] of onlinePresence.entries()) {
+    if (ts < cutoff) {
+      onlinePresence.delete(key)
+      changed = true
+    }
+  }
+  if (changed) broadcastOnlineCount()
+}, 30_000)
+
+// POST /api/presence/heartbeat — chamado pelo frontend a cada 30s
+app.post('/api/presence/heartbeat', (req, res) => {
+  const userId = String(req.body?.userId ?? '').trim()
+  // Só contabiliza usuários logados e cadastrados (com userId numérico válido)
+  if (!userId || userId === '0' || isNaN(Number(userId))) {
+    res.json({ ok: true }) // ignora silenciosamente sessões anônimas
+    return
+  }
+  const isNew = !onlinePresence.has(userId)
+  onlinePresence.set(userId, Date.now())
+  // Só faz broadcast quando é um novo cliente (evita flood a cada heartbeat renovado)
+  if (isNew) broadcastOnlineCount()
+  res.json({ ok: true })
+})
+
+// GET /api/presence/online-count — fallback REST (para o primeiro load do admin)
+app.get('/api/presence/online-count', (req, res) => {
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  let count = 0
+  for (const ts of onlinePresence.values()) {
+    if (ts >= cutoff) count++
+  }
+  res.json({ ok: true, onlineCount: count })
+})
+
+// GET /api/presence/online-users — retorna lista de userIds atualmente online
+app.get('/api/presence/online-users', (req, res) => {
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  const onlineUserIds: number[] = []
+  for (const [key, ts] of onlinePresence.entries()) {
+    if (ts >= cutoff) {
+      const num = Number(key)
+      if (!isNaN(num) && num > 0) onlineUserIds.push(num)
+    }
+  }
+  res.json({ ok: true, onlineUserIds })
+})
 
 // ─── Referral Commission Levels (priority static routes) ─────────────────────
 app.get('/api/referral/commission-levels/debug', async (_req, res) => {
@@ -1641,6 +1819,7 @@ const ensureRouletteCodesTable = async () => {
       description TEXT NULL,
       created_by_user_id BIGINT UNSIGNED NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
+      max_total_uses INT NOT NULL DEFAULT 0,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
@@ -1650,6 +1829,10 @@ const ensureRouletteCodesTable = async () => {
     )
     `
   )
+  // Garante coluna max_total_uses em tabelas já existentes
+  try {
+    await pool.query(`ALTER TABLE roulette_codes ADD COLUMN max_total_uses INT NOT NULL DEFAULT 0`)
+  } catch { /* coluna já existe */ }
 }
 
 const DEFAULT_ROULETTE_PROBABILITIES: Array<{ label: string; percent: number; sortOrder: number }> = [
@@ -1664,6 +1847,7 @@ const DEFAULT_ROULETTE_PROBABILITIES: Array<{ label: string; percent: number; so
 ]
 
 const ensureRouletteProbabilitiesTable = async () => {
+  // Cria a tabela se não existir
   await pool.query(
     `
     CREATE TABLE IF NOT EXISTS roulette_probabilities (
@@ -1680,17 +1864,21 @@ const ensureRouletteProbabilitiesTable = async () => {
     `
   )
 
-  for (const item of DEFAULT_ROULETTE_PROBABILITIES) {
-    await pool.query(
-      `
-      INSERT INTO roulette_probabilities (label, percent, sort_order)
-      VALUES (?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        sort_order = VALUES(sort_order),
-        updated_at = NOW()
-      `,
-      [item.label, Number(item.percent.toFixed(4)), item.sortOrder]
-    )
+  // Só insere os defaults se a tabela estiver vazia (não sobrescreve configurações salvas)
+  const [countRows] = await pool.query<RowDataPacket[]>(
+    'SELECT COUNT(*) AS total FROM roulette_probabilities'
+  )
+  const total = Number((countRows as RowDataPacket[])[0]?.total ?? 0)
+  if (total === 0) {
+    for (const item of DEFAULT_ROULETTE_PROBABILITIES) {
+      await pool.query(
+        `
+        INSERT IGNORE INTO roulette_probabilities (label, percent, sort_order)
+        VALUES (?, ?, ?)
+        `,
+        [item.label, Number(item.percent.toFixed(4)), item.sortOrder]
+      )
+    }
   }
 }
 
@@ -1717,8 +1905,8 @@ app.get('/api/admin/roulette-probabilities', requireMaxAdmin, async (_req: Authe
 
     res.json({ ok: true, probabilities })
   } catch (err) {
-    console.error('[admin-roulette-probabilities-get]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao carregar probabilidades da roleta.' })
+    console.error('[admin-roulette-probabilities-get] ERRO:', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar probabilidades da roleta.', detail: String(err) })
   }
 })
 
@@ -1749,26 +1937,20 @@ app.put('/api/admin/roulette-probabilities', requireMaxAdmin, async (req: Authen
     return
   }
 
-  const total = normalized.reduce((acc, item) => acc + item.percent, 0)
-  if (Math.abs(total - 100) > 0.0001) {
-    res.status(400).json({
-      ok: false,
-      error: `A soma dos percentuais deve ser 100%. Soma atual: ${total.toFixed(4)}%.`,
-    })
-    return
-  }
-
   const uniqueLabels = new Set(normalized.map((item) => item.label.toLowerCase()))
   if (uniqueLabels.size !== normalized.length) {
     res.status(400).json({ ok: false, error: 'Não é permitido repetir labels na configuração.' })
     return
   }
 
+  // Garante tabela antes de abrir transação (evita conflito entre pool e conn)
+  await ensureRouletteProbabilitiesTable()
+
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
-    await ensureRouletteProbabilitiesTable()
 
+    // Apaga todos e reinsere com os novos valores
     await conn.query('DELETE FROM roulette_probabilities')
 
     for (const item of normalized) {
@@ -1794,8 +1976,8 @@ app.put('/api/admin/roulette-probabilities', requireMaxAdmin, async (req: Authen
     })
   } catch (err) {
     await conn.rollback()
-    console.error('[admin-roulette-probabilities-put]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao salvar probabilidades da roleta.' })
+    console.error('[admin-roulette-probabilities-put] ERRO:', err)
+    res.status(500).json({ ok: false, error: 'Erro ao salvar probabilidades da roleta.', detail: String(err) })
   } finally {
     conn.release()
   }
@@ -1808,15 +1990,19 @@ app.get('/api/admin/roulette-codes', requireMaxAdmin, async (_req: Authenticated
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
-        id,
-        code,
-        reward_label AS reward,
-        description,
-        is_active AS isActive,
-        created_by_user_id AS createdByUserId,
-        created_at AS createdAt
-      FROM roulette_codes
-      ORDER BY id DESC
+        rc.id,
+        rc.code,
+        rc.reward_label AS reward,
+        rc.description,
+        rc.is_active AS isActive,
+        rc.max_total_uses AS maxTotalUses,
+        rc.created_by_user_id AS createdByUserId,
+        rc.created_at AS createdAt,
+        COUNT(rcr.id) AS redeemedCount
+      FROM roulette_codes rc
+      LEFT JOIN roulette_code_redemptions rcr ON rcr.roulette_code_id = rc.id
+      GROUP BY rc.id
+      ORDER BY rc.id DESC
       `
     )
 
@@ -1826,6 +2012,9 @@ app.get('/api/admin/roulette-codes', requireMaxAdmin, async (_req: Authenticated
       reward: String(row.reward ?? ''),
       description: String(row.description ?? ''),
       isActive: Number(row.isActive ?? 1) === 1,
+      maxTotalUses: Number(row.maxTotalUses ?? 0),
+      redeemedCount: Number(row.redeemedCount ?? 0),
+      isRedeemed: Number(row.redeemedCount ?? 0) > 0,
       createdByUserId: row.createdByUserId == null ? null : Number(row.createdByUserId),
       createdAt: row.createdAt ?? null,
     }))
@@ -1838,15 +2027,17 @@ app.get('/api/admin/roulette-codes', requireMaxAdmin, async (_req: Authenticated
 })
 
 app.post('/api/admin/roulette-codes', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
-  const { code, reward, description } = req.body as {
+  const { code, reward, description, maxTotalUses } = req.body as {
     code?: string
     reward?: string
     description?: string
+    maxTotalUses?: number | string
   }
 
   const normalizedCode = String(code ?? '').trim().toUpperCase()
   const normalizedReward = String(reward ?? '').trim()
   const normalizedDescription = String(description ?? '').trim()
+  const parsedMaxTotalUses = Math.max(0, Math.floor(Number(String(maxTotalUses ?? '0').replace(',', '.')) || 0))
 
   if (!normalizedCode) {
     res.status(400).json({ ok: false, error: 'Informe um código para a roleta.' })
@@ -1859,14 +2050,15 @@ app.post('/api/admin/roulette-codes', requireMaxAdmin, async (req: Authenticated
     const [result] = await pool.query(
       `
       INSERT INTO roulette_codes
-      (code, reward_label, description, created_by_user_id, is_active)
-      VALUES (?, ?, ?, ?, 1)
+      (code, reward_label, description, created_by_user_id, is_active, max_total_uses)
+      VALUES (?, ?, ?, ?, 1, ?)
       `,
       [
         normalizedCode,
         normalizedReward || null,
         normalizedDescription || null,
         Number(req.authUser?.id ?? 0) || null,
+        parsedMaxTotalUses,
       ]
     ) as any
 
@@ -1878,6 +2070,7 @@ app.post('/api/admin/roulette-codes', requireMaxAdmin, async (req: Authenticated
         code: normalizedCode,
         reward: normalizedReward,
         description: normalizedDescription,
+        maxTotalUses: parsedMaxTotalUses,
       },
     })
   } catch (err: any) {
@@ -1891,7 +2084,197 @@ app.post('/api/admin/roulette-codes', requireMaxAdmin, async (req: Authenticated
   }
 })
 
-app.post('/api/auth/register', async (req, res) => {
+app.delete('/api/admin/roulette-codes/:id', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const codeId = Number(req.params.id)
+  if (!codeId || Number.isNaN(codeId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  try {
+    await ensureRouletteCodesTable()
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, code FROM roulette_codes WHERE id = ? LIMIT 1',
+      [codeId]
+    )
+    if (rows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Código não encontrado.' })
+      return
+    }
+    await pool.query('DELETE FROM roulette_codes WHERE id = ?', [codeId])
+    res.json({ ok: true, message: `Código "${String(rows[0].code)}" excluído com sucesso.` })
+  } catch (err) {
+    console.error('[admin-roulette-codes-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao excluir código da roleta.' })
+  }
+})
+
+// ─── Resgatar código de roleta (usuário) ─────────────────────────────────────
+app.post('/api/roleta/redeem-code', redeemCodeLimiter, async (req, res) => {
+  const { userId, code } = req.body as { userId?: number; code?: string }
+  const parsedUserId = Number(userId)
+  const normalizedCode = String(code ?? '').trim().toUpperCase()
+
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+  if (!normalizedCode) {
+    res.status(400).json({ ok: false, error: 'Código inválido.' })
+    return
+  }
+
+  try {
+    await ensureRouletteCodesTable()
+
+    // Garante tabela de resgates
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS roulette_code_redemptions (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        roulette_code_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_rcr_code_user (roulette_code_id, user_id),
+        KEY idx_rcr_user_id (user_id),
+        KEY idx_rcr_code_id (roulette_code_id)
+      )
+    `)
+
+    // Busca o código
+    const [codeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, code, reward_label, is_active, max_total_uses FROM roulette_codes WHERE code = ? LIMIT 1`,
+      [normalizedCode]
+    )
+
+    if (codeRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Código não encontrado ou inválido.' })
+      sendTelegramLog(
+        `❌ <b>Falha no Resgate</b>\n` +
+        `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+        `🎟️ Código: <code>${normalizedCode}</code>\n` +
+        `⚠️ Motivo: Código não encontrado\n` +
+        `📅 ${new Date().toLocaleString('pt-BR')}`
+      ).catch(() => {})
+      return
+    }
+
+    const codeData = codeRows[0]
+
+    if (!Number(codeData.is_active ?? 1)) {
+      res.status(400).json({ ok: false, error: 'Este código está inativo.' })
+      sendTelegramLog(
+        `❌ <b>Falha no Resgate</b>\n` +
+        `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+        `🎟️ Código: <code>${normalizedCode}</code>\n` +
+        `⚠️ Motivo: Código inativo\n` +
+        `📅 ${new Date().toLocaleString('pt-BR')}`
+      ).catch(() => {})
+      return
+    }
+
+    // Verifica se o usuário já resgatou este código
+    const [alreadyRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM roulette_code_redemptions WHERE roulette_code_id = ? AND user_id = ? LIMIT 1',
+      [Number(codeData.id), parsedUserId]
+    )
+    if (alreadyRows.length > 0) {
+      res.status(409).json({ ok: false, error: 'Você já resgatou este código.' })
+      sendTelegramLog(
+        `❌ <b>Falha no Resgate</b>\n` +
+        `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+        `🎟️ Código: <code>${normalizedCode}</code>\n` +
+        `⚠️ Motivo: Usuário já resgatou este código\n` +
+        `📅 ${new Date().toLocaleString('pt-BR')}`
+      ).catch(() => {})
+      return
+    }
+
+    // Verifica limite total de usos (0 = ilimitado)
+    const maxTotalUses = Number(codeData.max_total_uses ?? 0)
+    if (maxTotalUses > 0) {
+      const [countRows] = await pool.query<RowDataPacket[]>(
+        'SELECT COUNT(*) AS total FROM roulette_code_redemptions WHERE roulette_code_id = ?',
+        [Number(codeData.id)]
+      )
+      const usedCount = Number((countRows as RowDataPacket[])[0]?.total ?? 0)
+      if (usedCount >= maxTotalUses) {
+        res.status(400).json({ ok: false, error: 'Este código já atingiu o limite máximo de usos.' })
+        sendTelegramLog(
+          `❌ <b>Falha no Resgate</b>\n` +
+          `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+          `🎟️ Código: <code>${normalizedCode}</code>\n` +
+          `⚠️ Motivo: Limite máximo de usos atingido (${usedCount}/${maxTotalUses})\n` +
+          `📅 ${new Date().toLocaleString('pt-BR')}`
+        ).catch(() => {})
+        return
+      }
+    }
+
+    // Define quantos giros conceder: reward_label numérico = quantidade de giros (padrão: 1)
+    const rewardLabel = String(codeData.reward_label ?? '').trim()
+    const spinsToAdd = Math.max(1, Number(rewardLabel) || 1)
+
+    // Registra o resgate
+    await pool.query(
+      'INSERT INTO roulette_code_redemptions (roulette_code_id, user_id) VALUES (?, ?)',
+      [Number(codeData.id), parsedUserId]
+    )
+
+    // Concede os giros ao usuário
+    await ensureUserRouletteSpinsTable()
+    await pool.query(
+      `
+      INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+      VALUES (?, ?, ?, 0)
+      ON DUPLICATE KEY UPDATE
+        available_spins = COALESCE(available_spins, 0) + ?,
+        total_earned = COALESCE(total_earned, 0) + ?,
+        updated_at = NOW()
+      `,
+      [parsedUserId, spinsToAdd, spinsToAdd, spinsToAdd, spinsToAdd]
+    )
+
+    // Busca giros disponíveis atualizados
+    const [spinsRows] = await pool.query<RowDataPacket[]>(
+      'SELECT available_spins AS availableSpins FROM user_roulette_spins WHERE user_id = ? LIMIT 1',
+      [parsedUserId]
+    )
+    const availableSpins = Number(spinsRows[0]?.availableSpins ?? spinsToAdd)
+
+    res.json({
+      ok: true,
+      message: `Código resgatado com sucesso! Você recebeu ${spinsToAdd} giro${spinsToAdd > 1 ? 's' : ''} na roleta.`,
+      spinsAdded: spinsToAdd,
+      availableSpins,
+    })
+
+    // Log de resgate bem-sucedido (fire-and-forget)
+    sendTelegramLog(
+      `✅ <b>Código Resgatado</b>\n` +
+      `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+      `🎟️ Código: <code>${normalizedCode}</code>\n` +
+      `🎰 Giros concedidos: <b>${spinsToAdd}</b>\n` +
+      `📅 ${new Date().toLocaleString('pt-BR')}`
+    ).catch(() => {})
+
+  } catch (err: any) {
+    if (String(err?.code ?? '') === 'ER_DUP_ENTRY') {
+      res.status(409).json({ ok: false, error: 'Você já resgatou este código.' })
+      sendTelegramLog(
+        `❌ <b>Falha no Resgate (código duplicado)</b>\n` +
+        `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+        `🎟️ Código: <code>${normalizedCode}</code>\n` +
+        `⚠️ Motivo: Usuário já resgatou este código\n` +
+        `📅 ${new Date().toLocaleString('pt-BR')}`
+      ).catch(() => {})
+      return
+    }
+    console.error('[roleta-redeem-code]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao resgatar código da roleta.' })
+  }
+})
+
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   const { name, phone, password, referralCode } = req.body as {
     name?: string
     phone?: string
@@ -1945,20 +2328,8 @@ app.post('/api/auth/register', async (req, res) => {
 
     const userId = result.insertId
 
-    if (referredByUserId) {
-      await ensureUserRouletteSpinsTable()
-      await pool.query(
-        `
-        INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
-        VALUES (?, 1, 1, 0)
-        ON DUPLICATE KEY UPDATE
-          available_spins = COALESCE(available_spins, 0) + 1,
-          total_earned = COALESCE(total_earned, 0) + 1,
-          updated_at = NOW()
-        `,
-        [referredByUserId]
-      )
-    }
+    // Giro da roleta NÃO é concedido no cadastro.
+    // O giro só é concedido quando o indicado (nível 1) fizer o primeiro depósito.
 
     // Gerar JWT
     const token = jwt.sign({ id: userId, phone }, JWT_SECRET, {
@@ -2025,7 +2396,7 @@ app.get('/api/user/summary/:id', async (req, res) => {
 })
 
 // ─── Login ───────────────────────────────────────────────────────────────────
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   const { phone, password } = req.body as {
     phone?: string
     password?: string
@@ -2304,18 +2675,32 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
 
           const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
           if (referredByUserId > 0) {
-            await ensureUserRouletteSpinsTable()
-            await pool.query(
+            // Giro só é concedido no PRIMEIRO depósito do indicado (nível 1)
+            const [prevDepositsRows] = await pool.query<RowDataPacket[]>(
               `
-              INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
-              VALUES (?, 1, 1, 0)
-              ON DUPLICATE KEY UPDATE
-                available_spins = COALESCE(available_spins, 0) + 1,
-                total_earned = COALESCE(total_earned, 0) + 1,
-                updated_at = NOW()
+              SELECT COUNT(*) AS total
+              FROM cashin_payments
+              WHERE user_id = ?
+                AND status IN ('paid', 'payment.paid')
+                AND id != ?
               `,
-              [referredByUserId]
+              [Number(existing.user_id), Number(existing.id)]
             )
+            const prevDeposits = Number((prevDepositsRows as RowDataPacket[])[0]?.total ?? 0)
+            if (prevDeposits === 0) {
+              await ensureUserRouletteSpinsTable()
+              await pool.query(
+                `
+                INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+                VALUES (?, 1, 1, 0)
+                ON DUPLICATE KEY UPDATE
+                  available_spins = COALESCE(available_spins, 0) + 1,
+                  total_earned = COALESCE(total_earned, 0) + 1,
+                  updated_at = NOW()
+                `,
+                [referredByUserId]
+              )
+            }
           }
 
           await applyReferralCommissionsForDeposit(
@@ -2380,18 +2765,32 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
 
         const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
         if (referredByUserId > 0) {
-          await ensureUserRouletteSpinsTable()
-          await pool.query(
+          // Giro só é concedido no PRIMEIRO depósito do indicado (nível 1)
+          const [prevDepositsRows2] = await pool.query<RowDataPacket[]>(
             `
-            INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
-            VALUES (?, 1, 1, 0)
-            ON DUPLICATE KEY UPDATE
-              available_spins = COALESCE(available_spins, 0) + 1,
-              total_earned = COALESCE(total_earned, 0) + 1,
-              updated_at = NOW()
+            SELECT COUNT(*) AS total
+            FROM cashin_payments
+            WHERE user_id = ?
+              AND status IN ('paid', 'payment.paid')
             `,
-            [referredByUserId]
+            [userId]
           )
+          const prevDeposits2 = Number((prevDepositsRows2 as RowDataPacket[])[0]?.total ?? 0)
+          // prevDeposits2 === 1 porque o INSERT acima já inseriu este depósito como paid
+          if (prevDeposits2 <= 1) {
+            await ensureUserRouletteSpinsTable()
+            await pool.query(
+              `
+              INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+              VALUES (?, 1, 1, 0)
+              ON DUPLICATE KEY UPDATE
+                available_spins = COALESCE(available_spins, 0) + 1,
+                total_earned = COALESCE(total_earned, 0) + 1,
+                updated_at = NOW()
+              `,
+              [referredByUserId]
+            )
+          }
         }
 
         const [createdRows] = await pool.query<RowDataPacket[]>(
@@ -3006,7 +3405,10 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         image_url AS imageUrl,
         is_active AS isActive,
         sort_order AS sortOrder,
-        plan_type AS planType
+        plan_type AS planType,
+        stock_quantity AS stockQuantity,
+        expires_at AS expiresAt,
+        require_commission_level3_count AS requireCommissionLevel3Count
       FROM cycle_products
       WHERE is_active = 1
       ORDER BY sort_order ASC, id ASC
@@ -3031,6 +3433,9 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         isActive: Number(row.isActive ?? 1) === 1,
         sortOrder: Number(row.sortOrder ?? 0),
         planType,
+        stockQuantity: Number(row.stockQuantity ?? 0),
+        expiresAt: row.expiresAt ?? null,
+        requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
       }
     })
 
@@ -3058,6 +3463,11 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         is_active AS isActive,
         sort_order AS sortOrder,
         plan_type AS planType,
+        stock_quantity AS stockQuantity,
+        expires_at AS expiresAt,
+        require_commission_level1_count AS requireCommissionLevel1Count,
+        require_commission_level2_count AS requireCommissionLevel2Count,
+        require_commission_level3_count AS requireCommissionLevel3Count,
         created_at AS createdAt
       FROM cycle_products
       ORDER BY sort_order ASC, id ASC
@@ -3075,6 +3485,11 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
       isActive: Number(row.isActive ?? 1) === 1,
       sortOrder: Number(row.sortOrder ?? 0),
       planType: String(row.planType ?? 'normal'),
+      stockQuantity: Number(row.stockQuantity ?? 0),
+      expiresAt: row.expiresAt ?? null,
+      requireCommissionLevel1Count: Number(row.requireCommissionLevel1Count ?? 0),
+      requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
+      requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
       createdAt: row.createdAt ?? null,
     }))
 
@@ -3086,7 +3501,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
 })
 
 app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType } = req.body as {
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType, stockQuantity } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -3096,6 +3511,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     cycleDays?: number | string
     sortOrder?: number | string
     planType?: string
+    stockQuantity?: number | string
   }
 
   const parsedName = String(name ?? '').trim()
@@ -3107,6 +3523,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
     isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+  const parsedStockQuantity = Number(String(stockQuantity ?? 0))
   const parsedPlanTypeRaw = String(planType ?? 'normal').trim().toLowerCase()
   const parsedPlanType =
     parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
@@ -3145,12 +3562,13 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         amount,
         profit,
         cycle_days,
+        stock_quantity,
         image_url,
         is_active,
         sort_order,
         plan_type
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
@@ -3158,6 +3576,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         Number(parsedPrice.toFixed(2)),
         Number(parsedRedeemRewardValue.toFixed(2)),
         parsedCycleDays,
+        Number.isFinite(parsedStockQuantity) ? parsedStockQuantity : 0,
         parsedImageUrl || null,
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
@@ -3181,7 +3600,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
 
 app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const productId = Number(req.params.id)
-  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType } = req.body as {
+  const { name, description, imageUrl, price, redeemRewardValue, isActive, cycleDays, sortOrder, planType, stockQuantity } = req.body as {
     name?: string
     description?: string
     imageUrl?: string
@@ -3191,6 +3610,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     cycleDays?: number | string
     sortOrder?: number | string
     planType?: string
+    stockQuantity?: number | string
   }
 
   if (!productId || Number.isNaN(productId)) {
@@ -3207,6 +3627,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
     isActive === true || isActive === 1 || String(isActive ?? '').toLowerCase() === 'true' ? 1 : 0
+  const parsedStockQuantity = Number(String(stockQuantity ?? 0))
   const parsedPlanTypeRaw = String(planType ?? 'normal').trim().toLowerCase()
   const parsedPlanType =
     parsedPlanTypeRaw === 'vip' || parsedPlanTypeRaw === 'vip_day'
@@ -3245,6 +3666,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         amount = ?,
         profit = ?,
         cycle_days = ?,
+        stock_quantity = ?,
         image_url = ?,
         is_active = ?,
         sort_order = ?,
@@ -3258,6 +3680,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         Number(parsedPrice.toFixed(2)),
         Number(parsedRedeemRewardValue.toFixed(2)),
         parsedCycleDays,
+        Number.isFinite(parsedStockQuantity) ? parsedStockQuantity : 0,
         parsedImageUrl || null,
         parsedIsActive,
         Number.isFinite(parsedSortOrder) ? parsedSortOrder : 0,
@@ -3303,6 +3726,192 @@ app.delete('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) =>
   } catch (err) {
     console.error('[admin-cycle-products-delete]', err)
     res.status(500).json({ ok: false, error: 'Erro ao apagar produto.' })
+  }
+})
+
+// ────────────────────────────────────────────────────────────────
+//  ADMIN — Mini Tasks
+// ────────────────────────────────────────────────────────────────
+
+const ensureMiniTasksTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mini_tasks (
+      id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      title       VARCHAR(255)    NOT NULL,
+      invite_goal INT UNSIGNED    NOT NULL DEFAULT 0,
+      reward_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+      badge_label VARCHAR(100)    NOT NULL DEFAULT '',
+      is_active   TINYINT(1)      NOT NULL DEFAULT 1,
+      sort_order  INT             NOT NULL DEFAULT 0,
+      created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_mini_tasks_sort (sort_order),
+      KEY idx_mini_tasks_active (is_active)
+    )
+  `)
+}
+
+app.get('/api/admin/mini-tasks', requireMaxAdmin, async (_req, res) => {
+  try {
+    await ensureMiniTasksTable()
+
+    const [rows] = await pool.query<RowDataPacket[]>(`
+      SELECT
+        id,
+        title,
+        invite_goal   AS inviteGoal,
+        reward_amount AS rewardAmount,
+        badge_label   AS badgeLabel,
+        is_active     AS isActive,
+        sort_order    AS sortOrder
+      FROM mini_tasks
+      ORDER BY sort_order ASC, id ASC
+    `)
+
+    const tasks = rows.map((row) => ({
+      id:           Number(row.id),
+      title:        String(row.title ?? ''),
+      inviteGoal:   Number(row.inviteGoal ?? 0),
+      rewardAmount: Number(row.rewardAmount ?? 0),
+      badgeLabel:   String(row.badgeLabel ?? ''),
+      isActive:     Boolean(row.isActive),
+      sortOrder:    Number(row.sortOrder ?? 0),
+    }))
+
+    res.json({ ok: true, tasks })
+  } catch (err) {
+    console.error('[admin-mini-tasks-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar mini tasks.' })
+  }
+})
+
+app.post('/api/admin/mini-tasks', requireMaxAdmin, async (req, res) => {
+  const { title, inviteGoal, rewardAmount, badgeLabel, isActive, sortOrder } = req.body as {
+    title?: string
+    inviteGoal?: number | string
+    rewardAmount?: number | string
+    badgeLabel?: string
+    isActive?: boolean | number
+    sortOrder?: number | string
+  }
+
+  const parsedTitle = String(title ?? '').trim()
+  if (!parsedTitle) {
+    res.status(400).json({ ok: false, error: 'Título é obrigatório.' })
+    return
+  }
+
+  const parsedInviteGoal  = Math.max(0, Math.round(Number(inviteGoal ?? 0)))
+  const parsedReward      = Math.max(0, Number(String(rewardAmount ?? '0').replace(',', '.')))
+  const parsedBadge       = String(badgeLabel ?? '').trim()
+  const parsedActive      = isActive === true || Number(isActive) === 1 ? 1 : 0
+  const parsedSortOrder   = Number(sortOrder ?? 0)
+
+  if (!Number.isFinite(parsedReward)) {
+    res.status(400).json({ ok: false, error: 'Recompensa inválida.' })
+    return
+  }
+
+  try {
+    await ensureMiniTasksTable()
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO mini_tasks (title, invite_goal, reward_amount, badge_label, is_active, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [parsedTitle, parsedInviteGoal, parsedReward, parsedBadge, parsedActive, parsedSortOrder]
+    ) as any
+
+    res.json({ ok: true, message: 'Mini task criada com sucesso.', id: Number(result?.insertId ?? 0) })
+  } catch (err) {
+    console.error('[admin-mini-tasks-post]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao criar mini task.' })
+  }
+})
+
+app.put('/api/admin/mini-tasks/:id', requireMaxAdmin, async (req, res) => {
+  const taskId = Number(req.params.id)
+  if (!taskId || !Number.isInteger(taskId) || taskId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  const { title, inviteGoal, rewardAmount, badgeLabel, isActive, sortOrder } = req.body as {
+    title?: string
+    inviteGoal?: number | string
+    rewardAmount?: number | string
+    badgeLabel?: string
+    isActive?: boolean | number
+    sortOrder?: number | string
+  }
+
+  const parsedTitle = String(title ?? '').trim()
+  if (!parsedTitle) {
+    res.status(400).json({ ok: false, error: 'Título é obrigatório.' })
+    return
+  }
+
+  const parsedInviteGoal  = Math.max(0, Math.round(Number(inviteGoal ?? 0)))
+  const parsedReward      = Math.max(0, Number(String(rewardAmount ?? '0').replace(',', '.')))
+  const parsedBadge       = String(badgeLabel ?? '').trim()
+  const parsedActive      = isActive === true || Number(isActive) === 1 ? 1 : 0
+  const parsedSortOrder   = Number(sortOrder ?? 0)
+
+  if (!Number.isFinite(parsedReward)) {
+    res.status(400).json({ ok: false, error: 'Recompensa inválida.' })
+    return
+  }
+
+  try {
+    await ensureMiniTasksTable()
+
+    const [result] = await pool.query(
+      `
+      UPDATE mini_tasks
+      SET title = ?, invite_goal = ?, reward_amount = ?, badge_label = ?, is_active = ?, sort_order = ?
+      WHERE id = ?
+      `,
+      [parsedTitle, parsedInviteGoal, parsedReward, parsedBadge, parsedActive, parsedSortOrder, taskId]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) === 0) {
+      res.status(404).json({ ok: false, error: 'Mini task não encontrada.' })
+      return
+    }
+
+    res.json({ ok: true, message: 'Mini task atualizada com sucesso.' })
+  } catch (err) {
+    console.error('[admin-mini-tasks-put]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar mini task.' })
+  }
+})
+
+app.delete('/api/admin/mini-tasks/:id', requireMaxAdmin, async (req, res) => {
+  const taskId = Number(req.params.id)
+  if (!taskId || !Number.isInteger(taskId) || taskId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    await ensureMiniTasksTable()
+
+    const [result] = await pool.query(
+      `DELETE FROM mini_tasks WHERE id = ?`,
+      [taskId]
+    ) as any
+
+    if (Number(result?.affectedRows ?? 0) === 0) {
+      res.status(404).json({ ok: false, error: 'Mini task não encontrada.' })
+      return
+    }
+
+    res.json({ ok: true, message: 'Mini task removida com sucesso.' })
+  } catch (err) {
+    console.error('[admin-mini-tasks-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao remover mini task.' })
   }
 })
 
@@ -3930,6 +4539,22 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         }
       : null
 
+    // Receita de hoje: soma de todos os créditos registrados nos logs do usuário no dia atual
+    // Considera apenas ações de crédito (amount > 0) excluindo compras (que debitam)
+    const [todayIncomeRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COALESCE(SUM(amount), 0) AS todayIncome
+      FROM logs
+      WHERE user_id = ?
+        AND amount > 0
+        AND action NOT IN ('cycle_investment_purchase', 'withdraw_request_created', 'withdraw_request_auto_processed')
+        AND DATE(created_at) = CURDATE()
+      `,
+      [userId]
+    ).catch(() => [[{ todayIncome: 0 }]] as [RowDataPacket[], unknown])
+
+    const todayIncome = Number(todayIncomeRows[0]?.todayIncome ?? 0)
+
     res.json({
       ok: true,
       metrics: {
@@ -3937,6 +4562,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         withdrawableBalance,
         hasActiveCyclePlan,
         activeCyclePlan,
+        todayIncome,
       },
     })
   } catch (err) {
@@ -3978,7 +4604,8 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
 
     const [products] = await conn.query<RowDataPacket[]>(
       `
-      SELECT id, name, amount, profit, cycle_days AS cycleDays, is_active AS isActive
+      SELECT id, name, amount, profit, cycle_days AS cycleDays, is_active AS isActive,
+             stock_quantity AS stockQuantity
       FROM cycle_products
       WHERE id = ?
       LIMIT 1
@@ -3990,6 +4617,13 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
     if (products.length === 0 || Number(products[0].isActive ?? 0) !== 1) {
       await conn.rollback()
       res.status(404).json({ ok: false, error: 'Produto de ciclo não encontrado ou inativo.' })
+      return
+    }
+
+    const stockQuantity = Number(products[0].stockQuantity ?? 0)
+    if (stockQuantity <= 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Produto esgotado. Estoque indisponível.' })
       return
     }
 
@@ -4037,6 +4671,16 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
       WHERE id = ?
       `,
       [amount, parsedUserId]
+    )
+
+    // Decrementa o estoque do produto (protegido pelo FOR UPDATE acima)
+    await conn.query(
+      `
+      UPDATE cycle_products
+      SET stock_quantity = GREATEST(stock_quantity - 1, 0)
+      WHERE id = ?
+      `,
+      [parsedCycleProductId]
     )
 
     const [purchaseInsertResult] = await conn.query(
@@ -4433,7 +5077,45 @@ app.get('/api/roleta/spins-available/:userId', async (req, res) => {
   }
 })
 
-app.post('/api/roleta/spin', async (req, res) => {
+// Fallback caso o banco esteja vazio
+const DEFAULT_ROULETTE_SEGMENTS = ['1 BRL', '16 BRL', '35 BRL', '50 BRL', '73 BRL', '90 BRL', '183 BRL', '16600 BRL']
+
+// Extrai o valor numérico de um label como '35 BRL' => 35
+function parsePrizeAmount(label: string): number {
+  const m = String(label).match(/[\d.,]+/)
+  if (!m) return 0
+  return Number(String(m[0]).replace(',', '.')) || 0
+}
+
+// Sorteia um item da lista com base nos pesos (percent)
+function weightedRandom(items: Array<{ label: string; percent: number }>): { label: string; percent: number } {
+  const total = items.reduce((acc, item) => acc + item.percent, 0)
+  let rand = Math.random() * total
+  for (const item of items) {
+    rand -= item.percent
+    if (rand <= 0) return item
+  }
+  return items[items.length - 1]
+}
+
+// Endpoint público: retorna os segmentos da roleta na ordem do banco (para o frontend sincronizar)
+app.get('/api/roleta/segments', async (_req, res) => {
+  try {
+    await ensureRouletteProbabilitiesTable()
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT label FROM roulette_probabilities ORDER BY sort_order ASC, id ASC'
+    )
+    const segments = rows.length > 0
+      ? rows.map((r) => String(r.label))
+      : DEFAULT_ROULETTE_SEGMENTS
+    res.json({ ok: true, segments })
+  } catch (err) {
+    console.error('[roleta-segments]', err)
+    res.json({ ok: true, segments: DEFAULT_ROULETTE_SEGMENTS })
+  }
+})
+
+app.post('/api/roleta/spin', spinLimiter, async (req, res) => {
   const { userId } = req.body as { userId?: number }
   const parsedUserId = Number(userId)
 
@@ -4442,10 +5124,33 @@ app.post('/api/roleta/spin', async (req, res) => {
     return
   }
 
-  const fixedPrizeAmount = 1
-  const selectedPrize = '1 BRL'
-  const selectedIndex = 0
-  const rotationFinal = 2160 + 45
+  // Carrega probabilidades do banco (com fallback para padrão)
+  // A ordem do banco (sort_order) define a posição visual de cada segmento na roda
+  await ensureRouletteProbabilitiesTable()
+  const [probRows] = await pool.query<RowDataPacket[]>(
+    'SELECT label, percent FROM roulette_probabilities ORDER BY sort_order ASC, id ASC'
+  )
+  const probabilities: Array<{ label: string; percent: number }> = probRows.length > 0
+    ? probRows.map((r) => ({ label: String(r.label), percent: Number(r.percent) }))
+    : DEFAULT_ROULETTE_SEGMENTS.map((label) => ({ label, percent: 100 / DEFAULT_ROULETTE_SEGMENTS.length }))
+
+  // Sorteia o prêmio com base nos pesos
+  const picked = weightedRandom(probabilities)
+  const selectedPrize = picked.label
+  const fixedPrizeAmount = parsePrizeAmount(selectedPrize)
+
+  // O índice visual do segmento é a posição no array de probabilidades (que segue sort_order do banco)
+  // Isso garante que prizeIndex corresponde ao segmento visual exato na roda do frontend
+  const selectedIndex = probabilities.findIndex(
+    (p) => p.label.toLowerCase() === selectedPrize.toLowerCase()
+  )
+  const finalSegmentIndex = selectedIndex >= 0 ? selectedIndex : 0
+
+  const segmentCount = probabilities.length
+  const segmentAngle = 360 / segmentCount
+  // Centro do segmento vencedor (em graus, sentido horário, 0° = topo)
+  const centerAngle = finalSegmentIndex * segmentAngle + segmentAngle / 2
+  // rotationFinal não é mais calculado no backend — o frontend calcula com base em prizeIndex
 
   const conn = await pool.getConnection()
   try {
@@ -4525,7 +5230,7 @@ app.post('/api/roleta/spin', async (req, res) => {
       (user_id, prize_label, prize_index, rotation_final, source)
       VALUES (?, ?, ?, ?, ?)
       `,
-      [parsedUserId, selectedPrize, selectedIndex, rotationFinal, 'invite_level_1_reward']
+      [parsedUserId, selectedPrize, finalSegmentIndex, centerAngle, 'invite_level_1_reward']
     ) as any
 
     await conn.query(
@@ -4592,14 +5297,29 @@ app.post('/api/roleta/spin', async (req, res) => {
         id: Number(result?.insertId ?? 0),
         userId: parsedUserId,
         prizeLabel: selectedPrize,
-        prizeIndex: selectedIndex,
-        rotationFinal,
+        // prizeIndex = posição do segmento no array do banco (sort_order), mesmo usado pelo frontend
+        prizeIndex: finalSegmentIndex,
+        // centerAngle = ângulo do centro do segmento vencedor (0° = topo, sentido horário)
+        centerAngle,
+        segmentCount,
         createdAt: new Date().toISOString(),
       },
       rewardAmount: Number(fixedPrizeAmount.toFixed(2)),
       availableSpinsAfter: Math.max(availableSpins - 1, 0),
       balanceAfter: newBalance,
     })
+
+    // Log do giro da roleta (fire-and-forget)
+    sendTelegramLog(
+      `🎰 <b>Giro da Roleta</b>\n` +
+      `👤 Usuário ID: <code>${parsedUserId}</code>\n` +
+      `🏆 Prêmio: <b>${selectedPrize}</b>\n` +
+      `💰 Valor: R$ ${Number(fixedPrizeAmount.toFixed(2)).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}\n` +
+      `💳 Saldo após: R$ ${Number(newBalance.toFixed(2)).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}\n` +
+      `🎟️ Giros restantes: ${Math.max(availableSpins - 1, 0)}\n` +
+      `📅 ${new Date().toLocaleString('pt-BR')}`
+    ).catch(() => {})
+
   } catch (err) {
     await conn.rollback()
     console.error('[roleta-spin]', err)
@@ -5923,27 +6643,57 @@ app.get('/api/withdraw/activation-status/:userId', requireAuth, async (req: Auth
 })
 
 app.post('/api/withdraw/request', async (req, res) => {
-  const { userId, amount, withdrawPassword } = req.body as {
-    userId?: number
-    amount?: number | string
-    withdrawPassword?: string
+  // ── Segurança: rejeita body não-objeto ou ausente ──
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    res.status(400).json({ ok: false, error: 'Requisição inválida.' })
+    return
   }
 
-  const parsedUserId = Number(userId)
-  const parsedAmount = Number(String(amount ?? '').replace(',', '.'))
-  const parsedPassword = String(withdrawPassword ?? '').trim()
+  const { userId, amount, withdrawPassword } = req.body as {
+    userId?: unknown
+    amount?: unknown
+    withdrawPassword?: unknown
+  }
 
-  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+  // ── Segurança: userId deve ser inteiro positivo ──
+  const parsedUserId = Number(userId)
+  if (!Number.isInteger(parsedUserId) || parsedUserId <= 0 || parsedUserId > 2_147_483_647) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
     return
   }
+
+  // ── Segurança: amount deve ser string/número, sem scripts, max 12 chars ──
+  const rawAmountStr = String(amount ?? '')
+    .replace(/[^0-9.,]/g, '') // somente dígitos, vírgula e ponto
+    .replace(',', '.')
+    .slice(0, 12)
+
+  const parsedAmount = Number(rawAmountStr)
 
   if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
     res.status(400).json({ ok: false, error: 'Informe um valor de saque válido.' })
     return
   }
 
-  if (!parsedPassword || parsedPassword.length < 6) {
+  // ── Segurança: não mais que 2 casas decimais ──
+  const decimalPart = rawAmountStr.split('.')[1] ?? ''
+  if (decimalPart.length > 2) {
+    res.status(400).json({ ok: false, error: 'Valor com no máximo 2 casas decimais.' })
+    return
+  }
+
+  // ── Segurança: limite absoluto — nenhum saque acima de R$ 100.000 via API ──
+  if (parsedAmount > 100_000) {
+    res.status(400).json({ ok: false, error: 'Valor de saque excede o limite permitido.' })
+    return
+  }
+
+  // ── Segurança: senha só aceita caracteres imprimíveis, sem controles ──
+  const parsedPassword = String(withdrawPassword ?? '')
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .trim()
+
+  if (!parsedPassword || parsedPassword.length < 6 || parsedPassword.length > 72) {
     res.status(400).json({ ok: false, error: 'Senha de saque inválida.' })
     return
   }
@@ -6109,12 +6859,7 @@ app.post('/api/withdraw/request', async (req, res) => {
 
     if (currentBalance < parsedAmount) {
       await conn.rollback()
-      res.status(400).json({
-        ok: false,
-        error: 'Saldo insuficiente para saque.',
-        required: parsedAmount,
-        available: currentBalance,
-      })
+      res.status(400).json({ ok: false, error: 'Saldo insuficiente para saque.' })
       return
     }
 
@@ -6208,6 +6953,8 @@ app.post('/api/withdraw/request', async (req, res) => {
       SELECT
         withdraw_auto_approve AS withdrawAutoApprove,
         withdraw_fee_percent AS withdrawFeePercent,
+        min_withdraw_amount AS minWithdrawAmount,
+        max_withdraw_amount AS maxWithdrawAmount,
         withdraw_start_time AS withdrawStartTime,
         withdraw_end_time AS withdrawEndTime,
         withdraw_allowed_days AS withdrawAllowedDays
@@ -6219,6 +6966,8 @@ app.post('/api/withdraw/request', async (req, res) => {
 
     const shouldAutoApprove = Number(configRows[0]?.withdrawAutoApprove ?? 0) === 1
     const withdrawFeePercentRaw = Number(configRows[0]?.withdrawFeePercent ?? 0)
+    const minWithdrawAmount = Number(configRows[0]?.minWithdrawAmount ?? 0)
+    const maxWithdrawAmount = Number(configRows[0]?.maxWithdrawAmount ?? 0)
     const withdrawStartTime = String(configRows[0]?.withdrawStartTime ?? '00:00').trim()
     const withdrawEndTime = String(configRows[0]?.withdrawEndTime ?? '23:59').trim()
     const allowedDaysSet = new Set(
@@ -6230,6 +6979,25 @@ app.post('/api/withdraw/request', async (req, res) => {
     const withdrawFeePercent = Number.isFinite(withdrawFeePercentRaw)
       ? Math.max(0, withdrawFeePercentRaw)
       : 0
+
+    // ── Segurança: valida min/max configurados no backend ──
+    if (Number.isFinite(minWithdrawAmount) && minWithdrawAmount > 0 && parsedAmount < minWithdrawAmount) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: `O valor mínimo de saque é R$ ${minWithdrawAmount.toFixed(2).replace('.', ',')}.`,
+      })
+      return
+    }
+
+    if (Number.isFinite(maxWithdrawAmount) && maxWithdrawAmount > 0 && parsedAmount > maxWithdrawAmount) {
+      await conn.rollback()
+      res.status(400).json({
+        ok: false,
+        error: `O valor máximo de saque é R$ ${maxWithdrawAmount.toFixed(2).replace('.', ',')}.`,
+      })
+      return
+    }
 
     const nowInSaoPaulo = new Date(
       new Date().toLocaleString('en-US', { timeZone: SAO_PAULO_TZ })
@@ -6274,22 +7042,32 @@ app.post('/api/withdraw/request', async (req, res) => {
       return
     }
 
-    const feeAmount = Number((parsedAmount * (withdrawFeePercent / 100)).toFixed(2))
-    const netAmount = Number((parsedAmount - feeAmount).toFixed(2))
+    // ── Segurança: arredonda para 2 casas antes de qualquer cálculo monetário ──
+    const safeAmount = Math.round(parsedAmount * 100) / 100
+
+    const feeAmount = Math.round(safeAmount * (withdrawFeePercent / 100) * 100) / 100
+    const netAmount = Math.round((safeAmount - feeAmount) * 100) / 100
 
     if (!Number.isFinite(netAmount) || netAmount <= 0) {
       await conn.rollback()
       res.status(400).json({
         ok: false,
         error: 'Valor líquido do saque inválido após taxa configurada.',
-        requestedAmount: Number(parsedAmount.toFixed(2)),
+        requestedAmount: safeAmount,
         feePercent: withdrawFeePercent,
       })
       return
     }
 
-    const oldBalance = Number(currentBalance.toFixed(2))
-    const newBalance = Number((oldBalance - parsedAmount).toFixed(2))
+    const oldBalance = Math.round(Number(currentBalance) * 100) / 100
+    const newBalance = Math.round((oldBalance - safeAmount) * 100) / 100
+
+    // ── Segurança: double-check saldo negativo após cálculo ──
+    if (newBalance < 0) {
+      await conn.rollback()
+      res.status(400).json({ ok: false, error: 'Saldo insuficiente para saque.' })
+      return
+    }
 
     await conn.query(
       `
@@ -6374,7 +7152,7 @@ app.post('/api/withdraw/request', async (req, res) => {
       `,
       [
         parsedUserId,
-        Number(parsedAmount.toFixed(2)),
+        safeAmount,
         holderName,
         holderCpf,
         pixKeyType,
@@ -6409,14 +7187,14 @@ app.post('/api/withdraw/request', async (req, res) => {
         shouldAutoApprove ? 'withdraw_request_auto_processed' : 'withdraw_request_created',
         oldBalance,
         newBalance,
-        Number(parsedAmount.toFixed(2)),
+        safeAmount,
         JSON.stringify({
           status: withdrawStatus,
           externalId,
           autoApprove: shouldAutoApprove,
           providerTransactionId,
           activationTokenId,
-          requestedAmount: Number(parsedAmount.toFixed(2)),
+          requestedAmount: safeAmount,
           feePercent: withdrawFeePercent,
           feeAmount,
           netAmount,
@@ -6433,7 +7211,7 @@ app.post('/api/withdraw/request', async (req, res) => {
         : 'Solicitação de saque enviada com sucesso.',
       withdraw: {
         id: Number(insertResult?.insertId ?? 0),
-        amount: Number(parsedAmount.toFixed(2)),
+        amount: safeAmount,
         feePercent: withdrawFeePercent,
         feeAmount,
         netAmount,
@@ -6759,6 +7537,9 @@ const ensureCycleProductsTable = async () => {
       image_url VARCHAR(500) NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       sort_order INT NOT NULL DEFAULT 0,
+      stock_quantity INT NOT NULL DEFAULT 0,
+      expires_at DATETIME NULL,
+      require_commission_level3_count INT NOT NULL DEFAULT 0,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
@@ -6799,6 +7580,36 @@ const ensureCycleProductsTable = async () => {
   await tryAlter(`
     ALTER TABLE cycle_products
     ADD COLUMN cycle_days INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN stock_quantity INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN expires_at DATETIME NULL
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN require_commission_level3_count INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN require_commission_level1_count INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN require_commission_level2_count INT NOT NULL DEFAULT 0
+  `)
+
+  await tryAlter(`
+    ALTER TABLE cycle_products
+    ADD COLUMN plan_type VARCHAR(20) NOT NULL DEFAULT 'normal'
   `)
 }
 
@@ -9489,6 +10300,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
       SELECT
         bot_token AS botToken,
         group_id AS groupId,
+        logs_group_id AS logsGroupId,
         welcome_message AS welcomeMessage,
         private_chat_only_message AS privateChatOnlyMessage,
         private_link_success_message AS privateLinkSuccessMessage,
@@ -9508,6 +10320,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
         config: {
           botToken: '',
           groupId: '',
+          logsGroupId: '',
           welcomeMessage: '',
           privateChatOnlyMessage: 'Conexão permitida somente no chat privado do bot.',
           privateLinkSuccessMessage: 'Conta conectada com sucesso.',
@@ -9525,6 +10338,7 @@ app.get('/api/admin/telegram-config', requireMaxAdmin, async (_req, res) => {
       config: {
         botToken: String(rows[0].botToken ?? ''),
         groupId: String(rows[0].groupId ?? ''),
+        logsGroupId: String(rows[0].logsGroupId ?? ''),
         welcomeMessage: String(rows[0].welcomeMessage ?? ''),
         privateChatOnlyMessage:
           String(rows[0].privateChatOnlyMessage ?? '').trim() ||
@@ -9551,6 +10365,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
   const {
     botToken,
     groupId,
+    logsGroupId,
     welcomeMessage,
     privateChatOnlyMessage,
     privateLinkSuccessMessage,
@@ -9560,6 +10375,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
   } = req.body as {
     botToken?: string
     groupId?: string
+    logsGroupId?: string
     welcomeMessage?: string
     privateChatOnlyMessage?: string
     privateLinkSuccessMessage?: string
@@ -9570,6 +10386,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
 
   const parsedBotToken = String(botToken ?? '').trim()
   const parsedGroupId = String(groupId ?? '').trim()
+  const parsedLogsGroupId = String(logsGroupId ?? '').trim()
   const parsedWelcomeMessage = String(welcomeMessage ?? '').trim()
   const parsedPrivateChatOnlyMessage =
     String(privateChatOnlyMessage ?? '').trim() ||
@@ -9605,6 +10422,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         singleton_key,
         bot_token,
         group_id,
+        logs_group_id,
         welcome_message,
         private_chat_only_message,
         private_link_success_message,
@@ -9612,10 +10430,11 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
         checkin_success_message,
         checkin_already_claimed_message
       )
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         bot_token = VALUES(bot_token),
         group_id = VALUES(group_id),
+        logs_group_id = VALUES(logs_group_id),
         welcome_message = VALUES(welcome_message),
         private_chat_only_message = VALUES(private_chat_only_message),
         private_link_success_message = VALUES(private_link_success_message),
@@ -9627,6 +10446,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
       [
         parsedBotToken,
         parsedGroupId,
+        parsedLogsGroupId,
         parsedWelcomeMessage,
         parsedPrivateChatOnlyMessage,
         parsedPrivateLinkSuccessMessage,
@@ -9642,6 +10462,7 @@ app.post('/api/admin/telegram-config', requireMaxAdmin, async (req, res) => {
       config: {
         botToken: parsedBotToken,
         groupId: parsedGroupId,
+        logsGroupId: parsedLogsGroupId,
         welcomeMessage: parsedWelcomeMessage,
         privateChatOnlyMessage: parsedPrivateChatOnlyMessage,
         privateLinkSuccessMessage: parsedPrivateLinkSuccessMessage,
@@ -9830,55 +10651,110 @@ app.post('/api/admin/site-settings', requireMaxAdmin, async (req, res) => {
 
 app.get('/api/admin/overview', requireMaxAdmin, async (_req, res) => {
   try {
+    // Total de usuários cadastrados
     const [activeUsersRows] = await pool.query<RowDataPacket[]>(
-      `
-      SELECT COUNT(*) AS total
-      FROM users
-      `
+      `SELECT COUNT(*) AS total FROM users`
     )
 
+    // Cadastros hoje
+    const [registrationsTodayRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM users WHERE DATE(created_at) = CURDATE()`
+    )
+
+    // Depósitos hoje — valor e contagem
     const [depositsTodayRows] = await pool.query<RowDataPacket[]>(
       `
-      SELECT COALESCE(SUM(amount), 0) AS total
+      SELECT
+        COALESCE(SUM(amount), 0) AS totalAmount,
+        COUNT(*) AS totalCount
       FROM cashin_payments
       WHERE LOWER(status) IN ('paid', 'payment.paid')
         AND DATE(COALESCE(paid_at, created_at)) = CURDATE()
       `
     )
 
+    // Depósitos no mês — valor e contagem
+    const [depositsMonthRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        COALESCE(SUM(amount), 0) AS totalAmount,
+        COUNT(*) AS totalCount
+      FROM cashin_payments
+      WHERE LOWER(status) IN ('paid', 'payment.paid')
+        AND YEAR(COALESCE(paid_at, created_at)) = YEAR(CURDATE())
+        AND MONTH(COALESCE(paid_at, created_at)) = MONTH(CURDATE())
+      `
+    )
+
     let pendingWithdrawals = 0
-    let withdrawalsPaid = 0
+    let withdrawalsTodayCount = 0
+    let withdrawalsTodayAmount = 0
+    let withdrawalsMonthCount = 0
+    let withdrawalsMonthAmount = 0
+    let withdrawalsPaidTotal = 0
+
     try {
+      // Saques pendentes (contagem)
       const [pendingRows] = await pool.query<RowDataPacket[]>(
-        `
-        SELECT COUNT(*) AS total
-        FROM withdrawals
-        WHERE LOWER(status) IN ('pending', 'processing')
-        `
+        `SELECT COUNT(*) AS total FROM withdrawals WHERE LOWER(status) IN ('pending', 'processing')`
       )
       pendingWithdrawals = Number(pendingRows[0]?.total ?? 0)
 
-      const [paidRows] = await pool.query<RowDataPacket[]>(
+      // Saques hoje — valor e contagem (todos os status)
+      const [wdTodayRows] = await pool.query<RowDataPacket[]>(
         `
-        SELECT COALESCE(SUM(amount), 0) AS total
+        SELECT
+          COALESCE(SUM(amount), 0) AS totalAmount,
+          COUNT(*) AS totalCount
         FROM withdrawals
-        WHERE LOWER(status) IN ('paid', 'payment.paid')
+        WHERE DATE(created_at) = CURDATE()
         `
       )
-      withdrawalsPaid = Number(paidRows[0]?.total ?? 0)
+      withdrawalsTodayCount = Number(wdTodayRows[0]?.totalCount ?? 0)
+      withdrawalsTodayAmount = Number(wdTodayRows[0]?.totalAmount ?? 0)
+
+      // Saques no mês — valor e contagem (todos os status)
+      const [wdMonthRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          COALESCE(SUM(amount), 0) AS totalAmount,
+          COUNT(*) AS totalCount
+        FROM withdrawals
+        WHERE YEAR(created_at) = YEAR(CURDATE())
+          AND MONTH(created_at) = MONTH(CURDATE())
+        `
+      )
+      withdrawalsMonthCount = Number(wdMonthRows[0]?.totalCount ?? 0)
+      withdrawalsMonthAmount = Number(wdMonthRows[0]?.totalAmount ?? 0)
+
+      // Total pago para cálculo da receita líquida
+      const [paidRows] = await pool.query<RowDataPacket[]>(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM withdrawals WHERE LOWER(status) IN ('paid', 'payment.paid')`
+      )
+      withdrawalsPaidTotal = Number(paidRows[0]?.total ?? 0)
     } catch {
-      pendingWithdrawals = 0
-      withdrawalsPaid = 0
+      // tabela withdrawals pode não existir ainda
     }
 
-    const depositsPaid = Number(depositsTodayRows[0]?.total ?? 0)
-    const netRevenue = Number((depositsPaid - withdrawalsPaid).toFixed(2))
+    const depositsTodayAmount = Number(depositsTodayRows[0]?.totalAmount ?? 0)
+    const depositsTodayCount = Number(depositsTodayRows[0]?.totalCount ?? 0)
+    const depositsMonthAmount = Number(depositsMonthRows[0]?.totalAmount ?? 0)
+    const depositsMonthCount = Number(depositsMonthRows[0]?.totalCount ?? 0)
+    const netRevenue = Number((depositsTodayAmount - withdrawalsPaidTotal).toFixed(2))
 
     res.json({
       ok: true,
       summary: {
         activeUsers: Number(activeUsersRows[0]?.total ?? 0),
-        depositsToday: depositsPaid,
+        registrationsToday: Number(registrationsTodayRows[0]?.total ?? 0),
+        depositsToday: depositsTodayAmount,
+        depositsTodayCount,
+        depositsMonthAmount,
+        depositsMonthCount,
+        withdrawalsTodayCount,
+        withdrawalsTodayAmount,
+        withdrawalsMonthCount,
+        withdrawalsMonthAmount,
         pendingWithdrawals,
         netRevenue,
       },
@@ -11694,6 +12570,262 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
       dailyCheckinRedemptions = []
     }
 
+    // ── Níveis de comissão com contagem de convidados por nível ────────────────
+    let commissionLevelStats: Array<{
+      level: number
+      name: string
+      commissionPercent: number
+      referralCount: number
+      referralsWithDeposit: number
+    }> = []
+
+    try {
+      await ensureCommissionLevelsTable()
+
+      const [commLevelRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          id,
+          level,
+          name,
+          commission_percent AS commissionPercent
+        FROM commission_levels
+        WHERE is_active = 1
+        ORDER BY level ASC
+        `
+      )
+
+      commissionLevelStats = await Promise.all(
+        commLevelRows.map(async (cl) => {
+          const lvl = Number(cl.level ?? 1)
+          try {
+            // Conta convidados no nível N (referrals recursivos)
+            const [countRows] = await pool.query<RowDataPacket[]>(
+              `
+              WITH RECURSIVE referral_tree AS (
+                SELECT id, referred_by_user_id, 1 AS depth
+                FROM users
+                WHERE referred_by_user_id = ?
+
+                UNION ALL
+
+                SELECT u.id, u.referred_by_user_id, rt.depth + 1
+                FROM users u
+                INNER JOIN referral_tree rt ON u.referred_by_user_id = rt.id
+                WHERE rt.depth < ?
+              )
+              SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN EXISTS (
+                  SELECT 1 FROM cashin_payments cp
+                  WHERE cp.user_id = rt.id
+                    AND LOWER(cp.status) IN ('paid', 'payment.paid')
+                ) THEN 1 ELSE 0 END) AS withDeposit
+              FROM referral_tree rt
+              WHERE rt.depth = ?
+              `,
+              [userId, lvl, lvl]
+            )
+            return {
+              level: lvl,
+              name: String(cl.name ?? `Nível ${lvl}`),
+              commissionPercent: Number(cl.commissionPercent ?? 0),
+              referralCount: Number(countRows[0]?.total ?? 0),
+              referralsWithDeposit: Number(countRows[0]?.withDeposit ?? 0),
+            }
+          } catch {
+            return {
+              level: lvl,
+              name: String(cl.name ?? `Nível ${lvl}`),
+              commissionPercent: Number(cl.commissionPercent ?? 0),
+              referralCount: 0,
+              referralsWithDeposit: 0,
+            }
+          }
+        })
+      )
+    } catch {
+      commissionLevelStats = []
+    }
+
+    // ── Histórico de depósitos ─────────────────────────────────────────────────
+    let depositHistory: Array<{
+      id: number
+      amount: number
+      status: string
+      method: string
+      externalId: string | null
+      paidAt: string | null
+      createdAt: string | null
+    }> = []
+
+    try {
+      const [depositHistRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          id,
+          amount,
+          status,
+          method,
+          provider_transaction_id AS externalId,
+          paid_at   AS paidAt,
+          created_at AS createdAt
+        FROM cashin_payments
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 200
+        `,
+        [userId]
+      )
+
+      depositHistory = depositHistRows.map((row) => ({
+        id:         Number(row.id),
+        amount:     Number(row.amount ?? 0),
+        status:     String(row.status ?? 'pending'),
+        method:     String(row.method ?? 'pix'),
+        externalId: row.externalId ? String(row.externalId) : null,
+        paidAt:     row.paidAt    ? String(row.paidAt)    : null,
+        createdAt:  row.createdAt ? String(row.createdAt) : null,
+      }))
+    } catch {
+      depositHistory = []
+    }
+
+    // ── Histórico de saques ────────────────────────────────────────────────────
+    let withdrawalHistory: Array<{
+      id: number
+      amount: number
+      status: string
+      holderName: string
+      pixKeyType: string
+      pixKey: string
+      externalId: string | null
+      paidAt: string | null
+      createdAt: string | null
+    }> = []
+
+    try {
+      const [withdrawHistRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          id,
+          amount,
+          status,
+          holder_name  AS holderName,
+          pix_key_type AS pixKeyType,
+          pix_key      AS pixKey,
+          external_id  AS externalId,
+          paid_at      AS paidAt,
+          created_at   AS createdAt
+        FROM withdrawals
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 200
+        `,
+        [userId]
+      ).catch(() => [[]])
+
+      withdrawalHistory = (withdrawHistRows as RowDataPacket[]).map((row) => ({
+        id:          Number(row.id),
+        amount:      Number(row.amount ?? 0),
+        status:      String(row.status ?? 'pending'),
+        holderName:  String(row.holderName ?? ''),
+        pixKeyType:  String(row.pixKeyType ?? ''),
+        pixKey:      String(row.pixKey ?? ''),
+        externalId:  row.externalId ? String(row.externalId) : null,
+        paidAt:      row.paidAt     ? String(row.paidAt)     : null,
+        createdAt:   row.createdAt  ? String(row.createdAt)  : null,
+      }))
+    } catch {
+      withdrawalHistory = []
+    }
+
+    // ── Giros da roleta realizados ──────────────────────────────────────────────
+    let rouletteSpins: Array<{
+      id: number
+      prizeLabel: string
+      prizeIndex: number
+      source: string
+      createdAt: string | null
+    }> = []
+
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS roulette_spins (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          user_id BIGINT UNSIGNED NOT NULL,
+          prize_label VARCHAR(80) NOT NULL,
+          prize_index INT NOT NULL,
+          rotation_final DECIMAL(12,4) NOT NULL DEFAULT 0,
+          source VARCHAR(30) NOT NULL DEFAULT 'roleta_page',
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          KEY idx_roulette_spins_user_id (user_id),
+          KEY idx_roulette_spins_created_at (created_at)
+        )
+      `).catch(() => null)
+
+      const [spinRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          id,
+          prize_label  AS prizeLabel,
+          prize_index  AS prizeIndex,
+          source,
+          created_at   AS createdAt
+        FROM roulette_spins
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 100
+        `,
+        [userId]
+      )
+
+      rouletteSpins = spinRows.map((row) => ({
+        id: Number(row.id),
+        prizeLabel: String(row.prizeLabel ?? ''),
+        prizeIndex: Number(row.prizeIndex ?? 0),
+        source: String(row.source ?? 'roleta_page'),
+        createdAt: row.createdAt ? String(row.createdAt) : null,
+      }))
+    } catch {
+      rouletteSpins = []
+    }
+
+    // ── Saldo de giros (earned / used / available) ──────────────────────────────
+    let rouletteSpinBalance: {
+      availableSpins: number
+      totalEarned: number
+      totalUsed: number
+    } = { availableSpins: 0, totalEarned: 0, totalUsed: 0 }
+
+    try {
+      await ensureUserRouletteSpinsTable()
+
+      const [balanceRows] = await pool.query<RowDataPacket[]>(
+        `
+        SELECT
+          available_spins AS availableSpins,
+          total_earned    AS totalEarned,
+          total_used      AS totalUsed
+        FROM user_roulette_spins
+        WHERE user_id = ?
+        LIMIT 1
+        `,
+        [userId]
+      )
+
+      if (balanceRows.length > 0) {
+        rouletteSpinBalance = {
+          availableSpins: Number(balanceRows[0].availableSpins ?? 0),
+          totalEarned:    Number(balanceRows[0].totalEarned   ?? 0),
+          totalUsed:      Number(balanceRows[0].totalUsed     ?? 0),
+        }
+      }
+    } catch {
+      rouletteSpinBalance = { availableSpins: 0, totalEarned: 0, totalUsed: 0 }
+    }
+
     const buildMembersByLevel = async (level: 1 | 2 | 3) => {
       const [rows] = await pool.query<RowDataPacket[]>(
         `
@@ -11791,6 +12923,11 @@ app.get('/api/admin/users/:id/details', requireMaxAdmin, async (req, res) => {
         cyclePurchases,
         giftCodeRedemptions,
         dailyCheckinRedemptions,
+        depositHistory,
+        withdrawalHistory,
+        commissionLevelStats,
+        rouletteSpins,
+        rouletteSpinBalance,
         referralsLevel1,
         referralsLevel2,
         referralsLevel3,
@@ -11828,6 +12965,19 @@ app.use((req, _res, next) => {
 
 io.on('connection', (socket) => {
   console.log(`[ws] client connected: ${socket.id}`)
+
+  // Envia o count atual + lista de IDs imediatamente para o cliente que acabou de conectar
+  const cutoff = Date.now() - PRESENCE_TTL_MS
+  let currentCount = 0
+  const currentOnlineIds: number[] = []
+  for (const [key, ts] of onlinePresence.entries()) {
+    if (ts >= cutoff) {
+      currentCount++
+      const num = Number(key)
+      if (!isNaN(num) && num > 0) currentOnlineIds.push(num)
+    }
+  }
+  socket.emit('online-count', { onlineCount: currentCount, onlineUserIds: currentOnlineIds })
 
   socket.on('telegram:subscribe', (payload: { userId?: number }) => {
     const userId = Number(payload?.userId ?? 0)
