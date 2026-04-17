@@ -4551,7 +4551,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         AND DATE(created_at) = CURDATE()
       `,
       [userId]
-    ).catch(() => [[{ todayIncome: 0 }]] as [RowDataPacket[], unknown])
+    ).catch(() => [[{ todayIncome: 0 }], []] as unknown as [RowDataPacket[], unknown])
 
     const todayIncome = Number(todayIncomeRows[0]?.todayIncome ?? 0)
 
