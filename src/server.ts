@@ -3807,6 +3807,162 @@ app.delete('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) =>
 })
 
 // ────────────────────────────────────────────────────────────────
+//  USER — Mini Tasks (public routes)
+// ────────────────────────────────────────────────────────────────
+
+const ensureMiniTaskRedemptionsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mini_task_redemptions (
+      id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id    BIGINT UNSIGNED NOT NULL,
+      task_id    BIGINT UNSIGNED NOT NULL,
+      redeemed_at DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_user_task (user_id, task_id)
+    )
+  `)
+}
+
+// GET /api/mini-tasks/:userId — lista tasks com progresso do usuário
+app.get('/api/mini-tasks/:userId', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || userId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    await ensureMiniTasksTable()
+    await ensureMiniTaskRedemptionsTable()
+
+    // Conta quantos indicados diretos o usuário tem
+    const [inviteRows] = await pool.query<RowDataPacket[]>(
+      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ?',
+      [userId]
+    )
+    const inviteCount = Number(inviteRows[0]?.total ?? 0)
+
+    // Busca tasks ativas
+    const [tasks] = await pool.query<RowDataPacket[]>(`
+      SELECT
+        t.id,
+        t.title,
+        t.invite_goal   AS inviteGoal,
+        t.reward_amount AS rewardAmount,
+        t.badge_label   AS badgeLabel,
+        t.sort_order    AS sortOrder,
+        (SELECT COUNT(*) FROM mini_task_redemptions r WHERE r.user_id = ? AND r.task_id = t.id) AS redeemed
+      FROM mini_tasks t
+      WHERE t.is_active = 1
+      ORDER BY t.sort_order ASC, t.id ASC
+    `, [userId])
+
+    const result = tasks.map((t) => ({
+      id:           Number(t.id),
+      title:        String(t.title ?? ''),
+      inviteGoal:   Number(t.inviteGoal ?? 0),
+      rewardAmount: Number(t.rewardAmount ?? 0),
+      badgeLabel:   String(t.badgeLabel ?? ''),
+      sortOrder:    Number(t.sortOrder ?? 0),
+      progress:     inviteCount,
+      redeemed:     Boolean(t.redeemed),
+      canRedeem:    !Boolean(t.redeemed) && inviteCount >= Number(t.inviteGoal ?? 0),
+    }))
+
+    res.json({ ok: true, tasks: result, inviteCount })
+  } catch (err) {
+    console.error('[mini-tasks-get-user]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar mini tasks.' })
+  }
+})
+
+// POST /api/mini-tasks/:taskId/redeem — resgata recompensa da task
+app.post('/api/mini-tasks/:taskId/redeem', requireAuth, async (req, res) => {
+  const taskId = Number(req.params.taskId)
+  const userId = Number((req as any).authUser?.id ?? 0)
+
+  if (!taskId || taskId <= 0 || !userId) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    await ensureMiniTasksTable()
+    await ensureMiniTaskRedemptionsTable()
+
+    // Busca a task
+    const [taskRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, title, invite_goal, reward_amount FROM mini_tasks WHERE id = ? AND is_active = 1',
+      [taskId]
+    )
+    if (taskRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Mini task não encontrada.' })
+      return
+    }
+    const task = taskRows[0]
+    const inviteGoal   = Number(task.invite_goal ?? 0)
+    const rewardAmount = Number(task.reward_amount ?? 0)
+
+    // Verifica se já resgatou
+    const [redeemedRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM mini_task_redemptions WHERE user_id = ? AND task_id = ?',
+      [userId, taskId]
+    )
+    if (redeemedRows.length > 0) {
+      res.status(400).json({ ok: false, error: 'Você já resgatou esta recompensa.' })
+      return
+    }
+
+    // Conta convites do usuário
+    const [inviteRows] = await pool.query<RowDataPacket[]>(
+      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ?',
+      [userId]
+    )
+    const inviteCount = Number(inviteRows[0]?.total ?? 0)
+
+    if (inviteCount < inviteGoal) {
+      res.status(400).json({
+        ok: false,
+        error: `Você precisa de ${inviteGoal} indicações para resgatar esta recompensa. Você tem ${inviteCount}.`
+      })
+      return
+    }
+
+    // Registra o resgate e credita o saldo em uma transação
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+
+      await conn.query(
+        'INSERT INTO mini_task_redemptions (user_id, task_id) VALUES (?, ?)',
+        [userId, taskId]
+      )
+
+      await conn.query(
+        'UPDATE users SET balance = balance + ? WHERE id = ?',
+        [rewardAmount, userId]
+      )
+
+      await conn.commit()
+    } catch (txErr) {
+      await conn.rollback()
+      throw txErr
+    } finally {
+      conn.release()
+    }
+
+    res.json({
+      ok: true,
+      message: `Parabéns! Você resgatou R$ ${rewardAmount.toFixed(2)} por completar a tarefa "${task.title}".`,
+      rewardAmount
+    })
+  } catch (err) {
+    console.error('[mini-tasks-redeem]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao resgatar recompensa.' })
+  }
+})
+
+// ────────────────────────────────────────────────────────────────
 //  ADMIN — Mini Tasks
 // ────────────────────────────────────────────────────────────────
 
