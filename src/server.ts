@@ -6792,6 +6792,42 @@ app.post('/api/user/change-password', async (req, res) => {
   }
 })
 
+// PUT /api/user/profile — usuário atualiza o próprio nome e senha
+app.put('/api/user/profile', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const authId = Number(req.authUser?.id ?? 0)
+  const { name, password } = req.body as { name?: string; password?: string }
+
+  const parsedName = String(name ?? '').trim()
+  if (!parsedName) {
+    res.status(400).json({ ok: false, error: 'Nome é obrigatório.' })
+    return
+  }
+
+  if (password !== undefined && password !== '' && String(password).length < 6) {
+    res.status(400).json({ ok: false, error: 'A nova senha deve ter no mínimo 6 caracteres.' })
+    return
+  }
+
+  try {
+    if (password && String(password).trim().length >= 6) {
+      const hash = await bcrypt.hash(String(password).trim(), 10)
+      await pool.query('UPDATE users SET name = ?, password = ? WHERE id = ?', [parsedName, hash, authId])
+    } else {
+      await pool.query('UPDATE users SET name = ? WHERE id = ?', [parsedName, authId])
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, name, phone, email FROM users WHERE id = ? LIMIT 1',
+      [authId]
+    )
+    const u = rows[0] ?? {}
+    res.json({ ok: true, message: 'Perfil atualizado com sucesso.', user: { id: u.id, name: u.name, phone: u.phone, email: u.email } })
+  } catch (err) {
+    console.error('[user-profile-update]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao atualizar perfil.' })
+  }
+})
+
 app.post('/api/withdraw/activation-token', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId } = req.body as { userId?: number }
   const parsedUserId = Number(userId)
