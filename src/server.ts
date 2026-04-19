@@ -14269,10 +14269,15 @@ app.post('/api/admin/shop/products/:id/codes', requireMaxAdmin, async (req, res)
     return
   }
   const { codes } = req.body as { codes?: string | string[] }
-  // aceita string com um código ou array de strings
-  const rawList: string[] = Array.isArray(codes)
-    ? codes
-    : String(codes ?? '').split('\n')
+  // aceita array, string separada por vírgula ou por quebra de linha
+  let rawList: string[]
+  if (Array.isArray(codes)) {
+    rawList = codes
+  } else {
+    const s = String(codes ?? '')
+    // se tiver vírgula, separa por vírgula; senão por linha
+    rawList = s.includes(',') ? s.split(',') : s.split('\n')
+  }
   const codeList = rawList.map((c) => c.trim()).filter((c) => c.length > 0)
   if (codeList.length === 0) {
     res.status(400).json({ ok: false, error: 'Nenhum código válido fornecido.' })
