@@ -1808,11 +1808,33 @@ const bootstrapDatabase = async () => {
     )
   `)
 
+  // ── Tabela de depósitos PIX da loja (shop_balance) ───────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_deposits (
+      id                      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id                 BIGINT UNSIGNED NOT NULL,
+      provider_transaction_id VARCHAR(200)    NULL,
+      amount                  DECIMAL(12,2)   NOT NULL,
+      status                  VARCHAR(50)     NOT NULL DEFAULT 'pending',
+      pix_code                TEXT            NULL,
+      qr_image                TEXT            NULL,
+      provider_payload        LONGTEXT        NULL,
+      paid_at                 DATETIME        NULL,
+      created_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_sd_user   (user_id),
+      KEY idx_sd_tx     (provider_transaction_id),
+      KEY idx_sd_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+
   console.log('[bootstrap-database] telegram config e conexões garantidas')
   console.log('[bootstrap-database] withdraw_activation_tokens table ensured')
   console.log('[bootstrap-database] commission_levels table ensured')
   console.log('[bootstrap-database] vip/mining tables ensured')
   console.log('[bootstrap-database] shop_balance e shop_balance_transactions garantidos')
+  console.log('[bootstrap-database] shop_deposits garantida')
 }
 
 bootstrapDatabase().catch((err) => {
@@ -2894,6 +2916,220 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
     res.status(200).send('OK')
   } catch (err) {
     console.error('[cashin-webhook]', err)
+    res.status(500).send('Erro')
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// DEPÓSITO PIX — LOJA (credita shop_balance, não balance)
+// ════════════════════════════════════════════════════════════════════════════
+
+/* POST /api/shop/deposit
+   Autenticado via Bearer JWT.
+   Body: { amount: number }
+   Cria cobrança PIX na Lumopay e salva em shop_deposits.
+   O webhook /api/shop/deposit/webhook credita shop_balance quando pago.
+*/
+app.post('/api/shop/deposit', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const userId = req.authUser!.id
+  const { amount } = req.body as { amount?: number }
+
+  const parsedAmount = Number(amount)
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+    res.status(400).json({ error: 'Valor de depósito inválido.' })
+    return
+  }
+  if (parsedAmount > 5000) {
+    res.status(400).json({ error: 'Valor máximo para depósito na loja: R$ 5.000,00' })
+    return
+  }
+
+  try {
+    const [users] = await pool.query<RowDataPacket[]>(
+      'SELECT id, name, phone FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+    if (!users.length) {
+      res.status(404).json({ error: 'Usuário não encontrado.' })
+      return
+    }
+    const user = users[0] as { id: number; name: string; phone: string }
+
+    const payload = {
+      amount:               Math.round(parsedAmount),
+      customerEmail:        `user${user.id}@pglm-loja.local`,
+      customerName:         user.name,
+      customerDocument:     '11615845445',
+      customerDocumentType: 'cpf',
+      customerPhone:        (user.phone || '').replace(/\D/g, '') || '11999998888',
+      description:          `Depósito loja PGLM - usuário #${user.id}`,
+      callbackUrl:          `https://api.pgl-m.com/api/shop/deposit/webhook`,
+      metadata: { userId: user.id, source: 'loja' },
+    }
+
+    const lumoResponse = await fetch('https://api.lumopayment.com/api/payments/transactions', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': LUMO_API_KEY },
+      body:    JSON.stringify(payload),
+    })
+    const lumoData = await lumoResponse.json() as any
+
+    if (!lumoResponse.ok || !lumoData?.success) {
+      res.status(502).json({ error: 'Falha ao criar cobrança PIX.', provider: lumoData })
+      return
+    }
+
+    const transactionId =
+      lumoData?.data?.id ??
+      lumoData?.data?.transaction_id ??
+      lumoData?.data?.payment_data?.transaction_id ??
+      null
+
+    const qrCode =
+      lumoData?.data?.payment_data?.qr_code ??
+      lumoData?.data?.payment_data?.pix_code ??
+      ''
+
+    const qrImage =
+      lumoData?.data?.payment_data?.qr_code_image ??
+      lumoData?.data?.payment_data?.qr_code_base64 ??
+      ''
+
+    const providerStatus = String(lumoData?.data?.status ?? lumoData?.status ?? 'pending')
+
+    const [insertResult] = await pool.query(
+      `INSERT INTO shop_deposits
+       (user_id, provider_transaction_id, amount, status, pix_code, qr_image, provider_payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        transactionId ? String(transactionId) : null,
+        parsedAmount,
+        providerStatus,
+        qrCode  || null,
+        qrImage || null,
+        JSON.stringify(lumoData),
+      ]
+    ) as any
+
+    res.json({
+      ok:            true,
+      depositId:     insertResult?.insertId ?? null,
+      transactionId,
+      amount:        parsedAmount,
+      qrCode,
+      provider:      lumoData,
+    })
+  } catch (err) {
+    console.error('[shop-deposit-create]', err)
+    res.status(500).json({ error: 'Erro interno ao criar cobrança.' })
+  }
+})
+
+/* POST /api/shop/deposit/webhook
+   Chamado pela Lumopay quando o pagamento é confirmado.
+   Valida assinatura HMAC-SHA256, credita shop_balance e registra em shop_balance_transactions.
+*/
+app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: Request, res: Response): Promise<void> => {
+  try {
+    const signatureHeader = req.headers['x-signature']
+    const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader ?? ''
+
+    const rawBody: Buffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body))
+
+    const calculated = crypto
+      .createHmac('sha256', LUMO_WEBHOOK_SECRET)
+      .update(rawBody)
+      .digest('hex')
+
+    if (!signature || !crypto.timingSafeEqual(Buffer.from(calculated), Buffer.from(String(signature)))) {
+      res.status(401).send('Assinatura inválida')
+      return
+    }
+
+    const data = JSON.parse(rawBody.toString('utf8')) as any
+
+    const status  = String(data?.status ?? '')
+    const normalizedStatus = status.toLowerCase()
+    const isPaid  = normalizedStatus === 'paid' || normalizedStatus === 'payment.paid'
+
+    const amountInCents = Number(data?.amount ?? 0)
+    const amountBRL     = amountInCents / 100
+
+    const providerTransactionId =
+      data?.id ??
+      data?.transaction_id ??
+      data?.data?.id ??
+      data?.data?.transaction_id ??
+      data?.payment_data?.transaction_id ??
+      null
+
+    if (!providerTransactionId) {
+      res.status(200).send('OK')
+      return
+    }
+
+    const [depositRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, status, user_id, amount FROM shop_deposits WHERE provider_transaction_id = ? LIMIT 1',
+      [String(providerTransactionId)]
+    )
+
+    if (!depositRows.length) {
+      res.status(200).send('OK')
+      return
+    }
+
+    const deposit = depositRows[0] as { id: number; status: string; user_id: number; amount: number | string }
+    const wasAlreadyPaid = ['paid', 'payment.paid'].includes(String(deposit.status).toLowerCase())
+
+    await pool.query(
+      `UPDATE shop_deposits
+       SET status = ?, provider_payload = ?,
+           paid_at   = CASE WHEN ? = 1 AND paid_at IS NULL THEN NOW() ELSE paid_at END,
+           updated_at = NOW()
+       WHERE id = ?`,
+      [normalizedStatus, JSON.stringify(data), isPaid ? 1 : 0, deposit.id]
+    )
+
+    if (isPaid && !wasAlreadyPaid) {
+      const creditAmount = Number(deposit.amount ?? amountBRL)
+      const conn = await pool.getConnection()
+      try {
+        await conn.beginTransaction()
+
+        const [lockRows] = await conn.query<RowDataPacket[]>(
+          'SELECT shop_balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+          [deposit.user_id]
+        )
+        const oldBalance = Number(lockRows[0]?.shop_balance ?? 0)
+        const newBalance = oldBalance + creditAmount
+
+        await conn.query(
+          'UPDATE users SET shop_balance = ? WHERE id = ?',
+          [newBalance, deposit.user_id]
+        )
+        await conn.query(
+          `INSERT INTO shop_balance_transactions
+           (user_id, type, amount, reason, reference_id, old_balance, new_balance, created_by)
+           VALUES (?, 'credit', ?, 'Depósito PIX loja', ?, ?, ?, NULL)`,
+          [deposit.user_id, creditAmount, String(deposit.id), oldBalance, newBalance]
+        )
+
+        await conn.commit()
+        console.log(`[shop-deposit-webhook] user ${deposit.user_id} credited R$${creditAmount} → shop_balance`)
+      } catch (txErr) {
+        await conn.rollback()
+        throw txErr
+      } finally {
+        conn.release()
+      }
+    }
+
+    res.status(200).send('OK')
+  } catch (err) {
+    console.error('[shop-deposit-webhook]', err)
     res.status(500).send('Erro')
   }
 })
