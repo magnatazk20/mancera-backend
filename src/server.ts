@@ -2678,21 +2678,25 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
     const payloadText = rawPayloadBuffer.toString('utf8')
     const data = JSON.parse(payloadText) as any
 
-    const status = String(data?.status ?? '')
-    const amountInCents = Number(data?.amount ?? 0)
-    const userId = Number(data?.metadata?.userId ?? data?.userId ?? 0)
+    /*
+     * Estrutura da Lumopay:
+     * { "event": "payment.paid", "data": { "transaction_id": "...", "amount": 3, "status": "paid", ... } }
+     * amount é em REAIS (não centavos).
+     */
+    const inner = data?.data ?? data
+
+    const status = String(inner?.status ?? data?.event ?? data?.status ?? '')
+    const amountBRL = Number(inner?.amount ?? data?.amount ?? 0)   // já em reais
+    const userId = Number(inner?.metadata?.userId ?? data?.metadata?.userId ?? data?.userId ?? 0)
     const providerTransactionId =
-      data?.id ??
+      inner?.transaction_id ??
+      inner?.id ??
       data?.transaction_id ??
-      data?.data?.id ??
-      data?.data?.transaction_id ??
-      data?.payment_data?.transaction_id ??
-      data?.data?.payment_data?.transaction_id ??
+      data?.id ??
       null
 
     const normalizedStatus = (status || 'pending').toLowerCase()
     const isPaid = normalizedStatus === 'paid' || normalizedStatus === 'payment.paid'
-    const amountBRL = amountInCents / 100
 
     if (providerTransactionId) {
       const [existingRows] = await pool.query<RowDataPacket[]>(
@@ -2817,7 +2821,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           userId,
           providerTransactionId ? String(providerTransactionId) : null,
           amountBRL > 0 ? amountBRL : 0,
-          String(data?.metadata?.method ?? 'pix'),
+          String(inner?.metadata?.method ?? data?.metadata?.method ?? 'pix'),
           normalizedStatus,
           JSON.stringify(data),
           isPaid ? new Date() : null,
@@ -3049,24 +3053,35 @@ app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: 
       return
     }
 
-    const data = JSON.parse(rawBody.toString('utf8')) as any
+    const payload = JSON.parse(rawBody.toString('utf8')) as any
 
-    const status  = String(data?.status ?? '')
-    const normalizedStatus = status.toLowerCase()
-    const isPaid  = normalizedStatus === 'paid' || normalizedStatus === 'payment.paid'
+    /*
+     * Estrutura da Lumopay:
+     * { "event": "payment.paid", "data": { "transaction_id": "...", "amount": 3, "status": "paid", ... } }
+     *
+     * "amount" é em REAIS (não centavos).
+     * O status pode vir em payload.event ("payment.paid") ou payload.data.status ("paid").
+     */
+    const inner = payload?.data ?? payload
 
-    const amountInCents = Number(data?.amount ?? 0)
-    const amountBRL     = amountInCents / 100
+    const rawStatus = String(inner?.status ?? payload?.event ?? payload?.status ?? '')
+    const normalizedStatus = rawStatus.toLowerCase()
+    const isPaid = normalizedStatus === 'paid' || normalizedStatus === 'payment.paid'
 
-    const providerTransactionId =
-      data?.id ??
-      data?.transaction_id ??
-      data?.data?.id ??
-      data?.data?.transaction_id ??
-      data?.payment_data?.transaction_id ??
+    /* amount em reais — a Lumopay envia sem multiplicar por 100 */
+    const amountFromPayload = Number(inner?.amount ?? payload?.amount ?? 0)
+
+    const providerTransactionId: string | null =
+      inner?.transaction_id ??
+      inner?.id ??
+      payload?.transaction_id ??
+      payload?.id ??
       null
 
+    console.log(`[shop-deposit-webhook] event=${payload?.event} tx=${providerTransactionId} status=${normalizedStatus} amount=${amountFromPayload}`)
+
     if (!providerTransactionId) {
+      console.warn('[shop-deposit-webhook] sem transaction_id, ignorando')
       res.status(200).send('OK')
       return
     }
@@ -3077,6 +3092,7 @@ app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: 
     )
 
     if (!depositRows.length) {
+      console.warn(`[shop-deposit-webhook] depósito não encontrado para tx=${providerTransactionId}`)
       res.status(200).send('OK')
       return
     }
@@ -3084,17 +3100,19 @@ app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: 
     const deposit = depositRows[0] as { id: number; status: string; user_id: number; amount: number | string }
     const wasAlreadyPaid = ['paid', 'payment.paid'].includes(String(deposit.status).toLowerCase())
 
+    /* atualiza status e paid_at na tabela */
     await pool.query(
       `UPDATE shop_deposits
        SET status = ?, provider_payload = ?,
-           paid_at   = CASE WHEN ? = 1 AND paid_at IS NULL THEN NOW() ELSE paid_at END,
+           paid_at    = CASE WHEN ? = 1 AND paid_at IS NULL THEN NOW() ELSE paid_at END,
            updated_at = NOW()
        WHERE id = ?`,
-      [normalizedStatus, JSON.stringify(data), isPaid ? 1 : 0, deposit.id]
+      [normalizedStatus, JSON.stringify(payload), isPaid ? 1 : 0, deposit.id]
     )
 
     if (isPaid && !wasAlreadyPaid) {
-      const creditAmount = Number(deposit.amount ?? amountBRL)
+      /* usa o amount salvo no depósito (o que o usuário solicitou) */
+      const creditAmount = Number(deposit.amount ?? amountFromPayload)
       const conn = await pool.getConnection()
       try {
         await conn.beginTransaction()
@@ -3118,13 +3136,15 @@ app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: 
         )
 
         await conn.commit()
-        console.log(`[shop-deposit-webhook] user ${deposit.user_id} credited R$${creditAmount} → shop_balance`)
+        console.log(`[shop-deposit-webhook] ✅ user ${deposit.user_id} +R$${creditAmount} → shop_balance=${newBalance}`)
       } catch (txErr) {
         await conn.rollback()
         throw txErr
       } finally {
         conn.release()
       }
+    } else if (wasAlreadyPaid) {
+      console.log(`[shop-deposit-webhook] depósito ${deposit.id} já estava pago, ignorando crédito`)
     }
 
     res.status(200).send('OK')
@@ -3163,6 +3183,68 @@ app.get('/api/shop/deposit/history', requireAuth, async (req: AuthenticatedReque
   } catch (err) {
     console.error('[shop-deposit-history]', err)
     res.status(500).json({ error: 'Erro ao buscar histórico.' })
+  }
+})
+
+/* POST /api/shop/deposit/reprocess — admin: reprocessa depósito pago que não foi creditado */
+app.post('/api/shop/deposit/reprocess', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  if (!req.authUser?.isAdmin) {
+    res.status(403).json({ error: 'Acesso restrito.' })
+    return
+  }
+  const { depositId } = req.body as { depositId?: number }
+  if (!depositId) {
+    res.status(400).json({ error: 'depositId obrigatório.' })
+    return
+  }
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, status, user_id, amount FROM shop_deposits WHERE id = ? LIMIT 1',
+      [depositId]
+    )
+    if (!rows.length) {
+      res.status(404).json({ error: 'Depósito não encontrado.' })
+      return
+    }
+    const deposit = rows[0] as { id: number; status: string; user_id: number; amount: number | string }
+    const wasAlreadyPaid = ['paid', 'payment.paid'].includes(String(deposit.status).toLowerCase())
+    if (wasAlreadyPaid) {
+      res.json({ ok: false, message: 'Depósito já estava marcado como pago.' })
+      return
+    }
+    const creditAmount = Number(deposit.amount)
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+      const [lockRows] = await conn.query<RowDataPacket[]>(
+        'SELECT shop_balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+        [deposit.user_id]
+      )
+      const oldBalance = Number(lockRows[0]?.shop_balance ?? 0)
+      const newBalance = oldBalance + creditAmount
+      await conn.query('UPDATE users SET shop_balance = ? WHERE id = ?', [newBalance, deposit.user_id])
+      await conn.query(
+        `INSERT INTO shop_balance_transactions
+         (user_id, type, amount, reason, reference_id, old_balance, new_balance, created_by)
+         VALUES (?, 'credit', ?, 'Depósito PIX loja (reprocessado)', ?, ?, ?, ?)`,
+        [deposit.user_id, creditAmount, String(deposit.id), oldBalance, newBalance, req.authUser!.id]
+      )
+      await conn.query(
+        `UPDATE shop_deposits SET status = 'paid', paid_at = NOW(), updated_at = NOW() WHERE id = ?`,
+        [deposit.id]
+      )
+      await conn.commit()
+      console.log(`[shop-deposit-reprocess] admin ${req.authUser!.id} reprocessou depósito ${deposit.id} → user ${deposit.user_id} +R$${creditAmount}`)
+      res.json({ ok: true, message: `R$${creditAmount} creditado para user ${deposit.user_id}.`, newBalance })
+    } catch (e) {
+      await conn.rollback()
+      throw e
+    } finally {
+      conn.release()
+    }
+  } catch (err) {
+    console.error('[shop-deposit-reprocess]', err)
+    res.status(500).json({ error: 'Erro ao reprocessar depósito.' })
   }
 })
 
