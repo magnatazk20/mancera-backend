@@ -11975,6 +11975,9 @@ app.get('/api/admin/withdrawals/pending', requireMaxAdmin, async (_req, res) => 
         w.created_at AS createdAt,
         w.updated_at AS updatedAt,
         w.paid_at AS paidAt,
+        w.holder_cpf AS holderCpf,
+        w.pix_key_type AS pixKeyType,
+        w.pix_key AS pixKey,
         u.id AS userId,
         u.name AS userName,
         u.phone AS userPhone
@@ -12000,6 +12003,9 @@ app.get('/api/admin/withdrawals/pending', requireMaxAdmin, async (_req, res) => 
         feePercent: configuredFeePercent,
         feeAmount,
         netAmount,
+        holderCpf: String(row.holderCpf ?? ''),
+        pixKeyType: String(row.pixKeyType ?? ''),
+        pixKey: String(row.pixKey ?? ''),
         user: {
           id: Number(row.userId),
           name: String(row.userName ?? 'Usuário'),
