@@ -4276,9 +4276,9 @@ app.get('/api/mini-tasks/:userId', requireAuth, async (req, res) => {
     await ensureMiniTasksTable()
     await ensureMiniTaskRedemptionsTable()
 
-    // Conta quantos indicados diretos o usuário tem
+    // Conta indicados diretos nível 1 (referred_by_user_id) que fizeram depósito
     const [inviteRows] = await pool.query<RowDataPacket[]>(
-      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ?',
+      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ? AND COALESCE(total_deposits, 0) > 0',
       [userId]
     )
     const inviteCount = Number(inviteRows[0]?.total ?? 0)
@@ -4354,9 +4354,9 @@ app.post('/api/mini-tasks/:taskId/redeem', requireAuth, async (req, res) => {
       return
     }
 
-    // Conta convites do usuário
+    // Conta indicados diretos nível 1 (referred_by_user_id) que fizeram depósito
     const [inviteRows] = await pool.query<RowDataPacket[]>(
-      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ?',
+      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ? AND COALESCE(total_deposits, 0) > 0',
       [userId]
     )
     const inviteCount = Number(inviteRows[0]?.total ?? 0)
