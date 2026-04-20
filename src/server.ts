@@ -429,6 +429,21 @@ const ensureTelegramConnectedSync = async () => {
 
 const normalizePhoneForCompare = (value: string) => String(value ?? '').replace(/\D/g, '')
 
+/**
+ * Normaliza número de telefone brasileiro para o formato sem formatação:
+ * +5511917051985  → 11917051985
+ * (11) 91705-1985 → 11917051985
+ * 11917051985     → 11917051985
+ */
+const normalizePhoneBR = (value: string): string => {
+  const digits = String(value ?? '').replace(/\D/g, '')
+  // Remove código do país 55 se o número ficar com mais de 11 dígitos
+  if (digits.startsWith('55') && digits.length > 11) {
+    return digits.slice(2)
+  }
+  return digits
+}
+
 const ensureWithdrawActivationTokensTable = async () => {
   await pool.query(
     `
@@ -2356,11 +2371,14 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     return
   }
 
+  // Normaliza telefone: remove não-dígitos e código do país 55
+  const normalizedPhone = normalizePhoneBR(phone)
+
   try {
     // Verificar se telefone já existe
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM users WHERE phone = ?',
-      [phone]
+      [normalizedPhone]
     )
 
     if (rows.length > 0) {
@@ -2387,7 +2405,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     // Inserir usuário com referral próprio
     const [result] = await pool.query(
       'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id) VALUES (?, ?, ?, ?, ?)',
-      [name, phone, hash, userReferralCode, referredByUserId]
+      [name, normalizedPhone, hash, userReferralCode, referredByUserId]
     ) as any
 
     const userId = result.insertId
@@ -2396,14 +2414,14 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     // O giro só é concedido quando o indicado (nível 1) fizer o primeiro depósito.
 
     // Gerar JWT
-    const token = jwt.sign({ id: userId, phone }, JWT_SECRET, {
+    const token = jwt.sign({ id: userId, phone: normalizedPhone }, JWT_SECRET, {
       expiresIn: JWT_EXPIRES as any,
     })
 
     res.status(201).json({
       message: `Conta criada com sucesso! Bem-vindo, ${name}.`,
       token,
-      user: { id: userId, name, phone, is_admin: 0 },
+      user: { id: userId, name, phone: normalizedPhone, is_admin: 0 },
     })
   } catch (err) {
     console.error('[register]', err)
@@ -2520,11 +2538,14 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     return
   }
 
+  // Normaliza telefone antes de buscar no banco
+  const normalizedPhone = normalizePhoneBR(phone)
+
   try {
     // Buscar usuário
     const [rows] = await pool.query<RowDataPacket[]>(
       'SELECT id, name, phone, password, is_admin FROM users WHERE phone = ?',
-      [phone]
+      [normalizedPhone]
     )
 
     if (rows.length === 0) {
