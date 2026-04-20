@@ -12813,6 +12813,34 @@ app.patch('/api/admin/users/:id/ban', requireMaxAdmin, async (req, res) => {
   }
 })
 
+app.delete('/api/admin/users/:id/telegram', requireMaxAdmin, async (req, res) => {
+  const userId = Number(req.params.id)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    // Remove a conexão da tabela user_telegram_connections
+    await pool.query(
+      `DELETE FROM user_telegram_connections WHERE user_id = ?`,
+      [userId]
+    )
+
+    // Zera o flag telegram_conectado no usuário
+    await pool.query(
+      `UPDATE users SET telegram_conectado = 0 WHERE id = ?`,
+      [userId]
+    )
+
+    res.json({ ok: true, message: 'Telegram desconectado com sucesso.' })
+  } catch (err) {
+    console.error('[admin-users-disconnect-telegram]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao desconectar Telegram.' })
+  }
+})
+
 app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.id)
   const { amount, operation, reason } = (req.body ?? {}) as {
