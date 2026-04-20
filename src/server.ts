@@ -2411,6 +2411,53 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 })
 
+// GET /api/user/invite-counts/:userId — retorna contagem de indicados com depósito por nível
+app.get('/api/user/invite-counts/:userId', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || userId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    // Nível 1: indicados diretos com depósito
+    const [lvl1Rows] = await pool.query<RowDataPacket[]>(
+      'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ? AND COALESCE(total_deposits, 0) > 0',
+      [userId]
+    )
+
+    // Nível 2: indicados dos indicados com depósito
+    const [lvl2Rows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM users
+       WHERE referred_by_user_id IN (SELECT id FROM users WHERE referred_by_user_id = ?)
+       AND COALESCE(total_deposits, 0) > 0`,
+      [userId]
+    )
+
+    // Nível 3: indicados dos indicados dos indicados com depósito
+    const [lvl3Rows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM users
+       WHERE referred_by_user_id IN (
+         SELECT id FROM users WHERE referred_by_user_id IN (
+           SELECT id FROM users WHERE referred_by_user_id = ?
+         )
+       )
+       AND COALESCE(total_deposits, 0) > 0`,
+      [userId]
+    )
+
+    res.json({
+      ok: true,
+      level1: Number(lvl1Rows[0]?.total ?? 0),
+      level2: Number(lvl2Rows[0]?.total ?? 0),
+      level3: Number(lvl3Rows[0]?.total ?? 0),
+    })
+  } catch (err) {
+    console.error('[user-invite-counts]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao buscar contagem de indicados.' })
+  }
+})
+
 // ─── Login ───────────────────────────────────────────────────────────────────
 app.get('/api/user/summary/:id', async (req, res) => {
   const userId = Number(req.params.id)
@@ -5307,7 +5354,10 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
     const [products] = await conn.query<RowDataPacket[]>(
       `
       SELECT id, name, amount, profit, cycle_days AS cycleDays, is_active AS isActive,
-             stock_quantity AS stockQuantity
+             stock_quantity AS stockQuantity,
+             require_commission_level_1_count AS requireLevel1,
+             require_commission_level_2_count AS requireLevel2,
+             require_commission_level_3_count AS requireLevel3
       FROM cycle_products
       WHERE id = ?
       LIMIT 1
@@ -5342,6 +5392,70 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
         available: userBalance,
       })
       return
+    }
+
+    // ── Valida regras de convite (indicados diretos nível 1/2/3 com depósito) ──
+    const requireLevel1 = Number(product.requireLevel1 ?? 0)
+    const requireLevel2 = Number(product.requireLevel2 ?? 0)
+    const requireLevel3 = Number(product.requireLevel3 ?? 0)
+
+    if (requireLevel1 > 0 || requireLevel2 > 0 || requireLevel3 > 0) {
+      // Nível 1: indicados diretos (referred_by_user_id = userId) com depósito
+      const [lvl1Rows] = await conn.query<RowDataPacket[]>(
+        'SELECT COUNT(*) AS total FROM users WHERE referred_by_user_id = ? AND COALESCE(total_deposits, 0) > 0',
+        [parsedUserId]
+      )
+      const countLevel1 = Number(lvl1Rows[0]?.total ?? 0)
+
+      // Nível 2: indicados dos indicados diretos com depósito
+      let countLevel2 = 0
+      if (requireLevel2 > 0) {
+        const [lvl2Rows] = await conn.query<RowDataPacket[]>(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE referred_by_user_id IN (
+             SELECT id FROM users WHERE referred_by_user_id = ?
+           )
+           AND COALESCE(total_deposits, 0) > 0`,
+          [parsedUserId]
+        )
+        countLevel2 = Number(lvl2Rows[0]?.total ?? 0)
+      }
+
+      // Nível 3: indicados dos indicados dos indicados com depósito
+      let countLevel3 = 0
+      if (requireLevel3 > 0) {
+        const [lvl3Rows] = await conn.query<RowDataPacket[]>(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE referred_by_user_id IN (
+             SELECT id FROM users WHERE referred_by_user_id IN (
+               SELECT id FROM users WHERE referred_by_user_id = ?
+             )
+           )
+           AND COALESCE(total_deposits, 0) > 0`,
+          [parsedUserId]
+        )
+        countLevel3 = Number(lvl3Rows[0]?.total ?? 0)
+      }
+
+      const errors: string[] = []
+      if (requireLevel1 > 0 && countLevel1 < requireLevel1) {
+        errors.push(`Nível 1: ${countLevel1}/${requireLevel1} indicados com depósito`)
+      }
+      if (requireLevel2 > 0 && countLevel2 < requireLevel2) {
+        errors.push(`Nível 2: ${countLevel2}/${requireLevel2} indicados com depósito`)
+      }
+      if (requireLevel3 > 0 && countLevel3 < requireLevel3) {
+        errors.push(`Nível 3: ${countLevel3}/${requireLevel3} indicados com depósito`)
+      }
+
+      if (errors.length > 0) {
+        await conn.rollback()
+        res.status(400).json({
+          ok: false,
+          error: `Você não cumpre os requisitos de convite para este produto. ${errors.join(' • ')}`,
+        })
+        return
+      }
     }
 
     await conn.query(
