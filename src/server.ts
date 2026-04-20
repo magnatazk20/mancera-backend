@@ -12082,8 +12082,24 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
     const userId = Number(withdrawal.userId)
     let providerTransactionId: string | null = null
     let providerResponsePayload: any = null
+    let feePercent = 0
+    let feeAmount = 0
+    let netAmount = amount
 
     if (parsedAction === 'approve') {
+      // Buscar taxa configurada para calcular valor líquido
+      const [feeConfigRows] = await conn.query<RowDataPacket[]>(
+        `
+        SELECT withdraw_fee_percent AS withdrawFeePercent
+        FROM system_withdraw_config
+        ORDER BY id ASC
+        LIMIT 1
+        `
+      )
+      feePercent = Number(feeConfigRows[0]?.withdrawFeePercent ?? 0)
+      feeAmount = Number(((amount * feePercent) / 100).toFixed(2))
+      netAmount = Number((amount - feeAmount).toFixed(2))
+
       const [pixRows] = await conn.query<RowDataPacket[]>(
         `
         SELECT holder_name AS holderName, holder_cpf AS holderCpf, pix_key_type AS pixKeyType, pix_key AS pixKey
@@ -12115,8 +12131,9 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         return
       }
 
+      // Envia o valor LÍQUIDO (bruto - taxa) ao provedor de pagamento
       const cashoutPayload = {
-        amount: Number(amount.toFixed(2)),
+        amount: netAmount,
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX #${withdrawalId}`,
@@ -12194,7 +12211,7 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
               selectedProvider: parsedProvider,
               processedByAdminId: Number(req.authUser?.id ?? 0),
               processedAt: new Date().toISOString(),
-              request: { amount },
+              request: { grossAmount: amount, feePercent, feeAmount, netAmount },
               response: providerResponsePayload,
             })
           : null,
