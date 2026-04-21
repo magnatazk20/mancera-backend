@@ -2499,6 +2499,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     )
 
     if (rows.length > 0) {
+      void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: null, httpStatus: 409, reason: `Tentativa de cadastro com telefone já existente: ${normalizedPhone}` })
       res.status(409).json({ error: 'Telefone já cadastrado.' })
       return
     }
@@ -2659,22 +2660,34 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   const normalizedPhone = normalizePhoneBR(phone)
 
   try {
+    // Garante coluna is_banned
+    await pool.query(`ALTER TABLE users ADD COLUMN is_banned TINYINT(1) NOT NULL DEFAULT 0`).catch(() => null)
+
     // Buscar usuário
     const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, name, phone, password, is_admin FROM users WHERE phone = ?',
+      'SELECT id, name, phone, password, is_admin, COALESCE(is_banned,0) AS is_banned FROM users WHERE phone = ?',
       [normalizedPhone]
     )
 
     if (rows.length === 0) {
+      void logSecurityEvent({ eventType: 'invalid_token', req, userId: null, httpStatus: 401, reason: `Tentativa de login com telefone não cadastrado: ${normalizedPhone}` })
       res.status(401).json({ error: 'Telefone ou senha incorretos.' })
       return
     }
 
     const user = rows[0]
 
+    // Verificar se usuário está banido
+    if (Number(user.is_banned ?? 0) === 1) {
+      void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: Number(user.id), httpStatus: 403, reason: `Tentativa de login de usuário banido: ${normalizedPhone}` })
+      res.status(403).json({ error: 'Sua conta foi suspensa. Entre em contato com o suporte.' })
+      return
+    }
+
     // Verificar senha
     const valid = await bcrypt.compare(password, user.password as string)
     if (!valid) {
+      void logSecurityEvent({ eventType: 'invalid_token', req, userId: Number(user.id), httpStatus: 401, reason: `Senha incorreta no login para telefone: ${normalizedPhone}` })
       res.status(401).json({ error: 'Telefone ou senha incorretos.' })
       return
     }
