@@ -4122,7 +4122,8 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         expires_at AS expiresAt,
         require_commission_level_1_count AS requireCommissionLevel1Count,
         require_commission_level_2_count AS requireCommissionLevel2Count,
-        require_commission_level_3_count AS requireCommissionLevel3Count
+        require_commission_level_3_count AS requireCommissionLevel3Count,
+        COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser
       FROM cycle_products
       WHERE is_active = 1
       ORDER BY sort_order ASC, id ASC
@@ -4152,6 +4153,7 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         requireCommissionLevel1Count: Number(row.requireCommissionLevel1Count ?? 0),
         requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
         requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
+        maxPurchasesPerUser: Number(row.maxPurchasesPerUser ?? 0),
       }
     })
 
@@ -4159,6 +4161,33 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
   } catch (err) {
     console.error('[dashboard-cycle-products]', err)
     res.status(500).json({ ok: false, error: 'Erro ao listar planos de ciclo.' })
+  }
+})
+
+// GET /api/cycle-products/my-purchases/:userId — quantas vezes o usuário comprou cada produto
+app.get('/api/cycle-products/my-purchases/:userId', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+  if (userId !== Number(req.authUser?.id ?? 0)) {
+    res.status(403).json({ ok: false, error: 'Ação não permitida.' })
+    return
+  }
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT cycle_product_id AS productId, COUNT(*) AS total FROM cycle_orders WHERE user_id = ? GROUP BY cycle_product_id`,
+      [userId]
+    )
+    const purchases: Record<number, number> = {}
+    for (const row of rows) {
+      purchases[Number(row.productId)] = Number(row.total ?? 0)
+    }
+    res.json({ ok: true, purchases })
+  } catch (err) {
+    console.error('[cycle-my-purchases]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao consultar compras.' })
   }
 })
 
