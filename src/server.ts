@@ -3819,7 +3819,7 @@ app.delete('/api/admin/monthly-salary-plans/:id', requireMaxAdmin, async (req, r
   }
 })
 
-app.post('/api/monthly-salary-plans/claim', async (req, res) => {
+app.post('/api/monthly-salary-plans/claim', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId, planId } = req.body as { userId?: number; planId?: number }
 
   const parsedUserId = Number(userId)
@@ -3827,6 +3827,12 @@ app.post('/api/monthly-salary-plans/claim', async (req, res) => {
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: Number(req.authUser?.id ?? 0), attemptedUserId: parsedUserId, httpStatus: 403, reason: 'Tentativa de claim de salário mensal em conta de outro usuário' })
+    res.status(403).json({ ok: false, error: 'Ação não permitida.' })
     return
   }
 
@@ -4919,7 +4925,7 @@ app.get('/api/vip/user/:userId', async (req, res) => {
   }
 })
 
-app.post('/api/vip/activate', async (req, res) => {
+app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId, vipLevelId } = req.body as { userId?: number; vipLevelId?: number }
 
   const parsedUserId = Number(userId)
@@ -4927,6 +4933,12 @@ app.post('/api/vip/activate', async (req, res) => {
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: Number(req.authUser?.id ?? 0), attemptedUserId: parsedUserId, httpStatus: 403, reason: 'Tentativa de ativação de VIP em conta de outro usuário' })
+    res.status(403).json({ ok: false, error: 'Ação não permitida.' })
     return
   }
 
@@ -5471,7 +5483,7 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
   }
 })
 
-app.post('/api/cycle-products/purchase', async (req, res) => {
+app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId, cycleProductId } = req.body as { userId?: number; cycleProductId?: number }
 
   const parsedUserId = Number(userId)
@@ -5479,6 +5491,12 @@ app.post('/api/cycle-products/purchase', async (req, res) => {
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: Number(req.authUser?.id ?? 0), attemptedUserId: parsedUserId, httpStatus: 403, reason: 'Tentativa de compra de produto cycle em conta de outro usuário' })
+    res.status(403).json({ ok: false, error: 'Ação não permitida.' })
     return
   }
 
@@ -7310,7 +7328,7 @@ app.get('/api/user/withdraw-password/status/:userId', async (req, res) => {
   }
 })
 
-app.post('/api/user/withdraw-password', async (req, res) => {
+app.post('/api/user/withdraw-password', requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId, password } = req.body as { userId?: number; password?: string }
 
   const parsedUserId = Number(userId)
@@ -7318,6 +7336,12 @@ app.post('/api/user/withdraw-password', async (req, res) => {
 
   if (!parsedUserId || Number.isNaN(parsedUserId)) {
     res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  if (parsedUserId !== Number(req.authUser?.id ?? 0)) {
+    void logSecurityEvent({ eventType: 'unauthorized_action', req, userId: Number(req.authUser?.id ?? 0), attemptedUserId: parsedUserId, httpStatus: 403, reason: 'Tentativa de alterar senha de saque em conta de outro usuário' })
+    res.status(403).json({ ok: false, error: 'Ação não permitida.' })
     return
   }
 
