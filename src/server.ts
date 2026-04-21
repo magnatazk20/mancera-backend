@@ -1438,6 +1438,13 @@ const ensureSecurityLogsTable = async () => {
   `)
 }
 
+const EVENT_TYPE_EMOJI: Record<string, string> = {
+  missing_token: '🔑',
+  invalid_token: '❌',
+  unauthorized_action: '🚨',
+  rate_limit_exceeded: '⚡',
+}
+
 const logSecurityEvent = async (opts: {
   eventType: string
   req: Request
@@ -1474,6 +1481,23 @@ const logSecurityEvent = async (opts: {
         opts.extra ? JSON.stringify(opts.extra) : null,
       ]
     )
+
+    // Envia notificação para o grupo de logs do Telegram
+    const emoji = EVENT_TYPE_EMOJI[opts.eventType] ?? '⚠️'
+    const lines: string[] = [
+      `${emoji} <b>Evento de Segurança</b>`,
+      `Tipo: <code>${opts.eventType}</code>`,
+      `Status: <code>${opts.httpStatus}</code>`,
+      `Motivo: ${opts.reason}`,
+      `IP: <code>${ip}</code>`,
+      `Endpoint: <code>${method} ${endpoint}</code>`,
+    ]
+    if (opts.userId) lines.push(`Usuário logado: ID <code>${opts.userId}</code>`)
+    if (opts.attemptedUserId) lines.push(`⚠️ Usuário alvo: ID <code>${opts.attemptedUserId}</code>`)
+    if (opts.extra && Object.keys(opts.extra).length > 0) {
+      lines.push(`Extra: <code>${JSON.stringify(opts.extra)}</code>`)
+    }
+    void sendTelegramLog(lines.join('\n'))
   } catch {
     // silently ignore logging errors
   }
