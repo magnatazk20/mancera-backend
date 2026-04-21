@@ -4184,6 +4184,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         require_commission_level_1_count AS requireCommissionLevel1Count,
         require_commission_level_2_count AS requireCommissionLevel2Count,
         require_commission_level_3_count AS requireCommissionLevel3Count,
+        COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser,
         created_at AS createdAt
       FROM cycle_products
       ORDER BY sort_order ASC, id ASC
@@ -4206,6 +4207,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
       requireCommissionLevel1Count: Number(row.requireCommissionLevel1Count ?? 0),
       requireCommissionLevel2Count: Number(row.requireCommissionLevel2Count ?? 0),
       requireCommissionLevel3Count: Number(row.requireCommissionLevel3Count ?? 0),
+      maxPurchasesPerUser: Number(row.maxPurchasesPerUser ?? 0),
       createdAt: row.createdAt ?? null,
     }))
 
@@ -4221,6 +4223,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     name, description, imageUrl, price, redeemRewardValue, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
+    maxPurchasesPerUser,
   } = req.body as {
     name?: string
     description?: string
@@ -4236,6 +4239,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     requireCommissionLevel1Count?: number | string
     requireCommissionLevel2Count?: number | string
     requireCommissionLevel3Count?: number | string
+    maxPurchasesPerUser?: number | string
   }
 
   const parsedName = String(name ?? '').trim()
@@ -4257,6 +4261,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const parsedLevel2 = Math.max(0, Number(String(requireCommissionLevel2Count ?? 0)))
   const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
   const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
+  const parsedMaxPurchasesPerUser = Math.max(0, Number(String(maxPurchasesPerUser ?? 0)))
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -4298,9 +4303,10 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         expires_at,
         require_commission_level_1_count,
         require_commission_level_2_count,
-        require_commission_level_3_count
+        require_commission_level_3_count,
+        max_purchases_per_user
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
@@ -4317,6 +4323,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         parsedLevel1,
         parsedLevel2,
         parsedLevel3,
+        parsedMaxPurchasesPerUser,
       ]
     ) as any
 
@@ -4340,6 +4347,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     name, description, imageUrl, price, redeemRewardValue, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
+    maxPurchasesPerUser,
   } = req.body as {
     name?: string
     description?: string
@@ -4355,6 +4363,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     requireCommissionLevel1Count?: number | string
     requireCommissionLevel2Count?: number | string
     requireCommissionLevel3Count?: number | string
+    maxPurchasesPerUser?: number | string
   }
 
   if (!productId || Number.isNaN(productId)) {
@@ -4381,6 +4390,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const parsedLevel2 = Math.max(0, Number(String(requireCommissionLevel2Count ?? 0)))
   const parsedLevel3 = Math.max(0, Number(String(requireCommissionLevel3Count ?? 0)))
   const parsedExpiresAt = parsedPlanType === 'vip_day' && expiresAt ? String(expiresAt) : null
+  const parsedMaxPurchasesPerUser = Math.max(0, Number(String(maxPurchasesPerUser ?? 0)))
 
   if (!parsedName) {
     res.status(400).json({ ok: false, error: 'Nome do produto é obrigatório.' })
@@ -4423,6 +4433,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         require_commission_level_1_count = ?,
         require_commission_level_2_count = ?,
         require_commission_level_3_count = ?,
+        max_purchases_per_user = ?,
         updated_at = NOW()
       WHERE id = ?
       `,
@@ -4441,6 +4452,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         parsedLevel1,
         parsedLevel2,
         parsedLevel3,
+        parsedMaxPurchasesPerUser,
         productId,
       ]
     ) as any
@@ -5539,7 +5551,8 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
              stock_quantity AS stockQuantity,
              require_commission_level_1_count AS requireLevel1,
              require_commission_level_2_count AS requireLevel2,
-             require_commission_level_3_count AS requireLevel3
+             require_commission_level_3_count AS requireLevel3,
+             COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser
       FROM cycle_products
       WHERE id = ?
       LIMIT 1
@@ -5559,6 +5572,21 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
       await conn.rollback()
       res.status(400).json({ ok: false, error: 'Produto esgotado. Estoque indisponível.' })
       return
+    }
+
+    // Verificar limite de compras por usuário
+    const maxPerUser = Number(products[0].maxPurchasesPerUser ?? 0)
+    if (maxPerUser > 0) {
+      const [purchaseCountRows] = await conn.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS total FROM cycle_orders WHERE user_id = ? AND cycle_product_id = ?`,
+        [parsedUserId, parsedCycleProductId]
+      )
+      const alreadyPurchased = Number(purchaseCountRows[0]?.total ?? 0)
+      if (alreadyPurchased >= maxPerUser) {
+        await conn.rollback()
+        res.status(400).json({ ok: false, error: `Limite de ${maxPerUser} compra${maxPerUser > 1 ? 's' : ''} por usuário atingido para este produto.` })
+        return
+      }
     }
 
     const product = products[0]
@@ -8644,6 +8672,7 @@ const ensureCycleProductsTable = async () => {
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_1_count INT NOT NULL DEFAULT 0`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_2_count INT NOT NULL DEFAULT 0`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN require_commission_level_3_count INT NOT NULL DEFAULT 0`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN max_purchases_per_user INT NOT NULL DEFAULT 0`)
 }
 
 type CommissionLevelRequirementInput = {
