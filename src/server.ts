@@ -13403,6 +13403,68 @@ app.get('/api/admin/logs', requireMaxAdmin, async (req, res) => {
   }
 })
 
+// ─── Logs de Correção de Saldo (cycle_capital_return_correction) ─────────────
+app.get('/api/admin/correction-logs', requireMaxAdmin, async (req, res) => {
+  const rawLimit = Number(req.query.limit ?? 500)
+  const limit = Math.min(Math.max(rawLimit, 1), 2000)
+
+  try {
+    const parseMetadata = (value: unknown) => {
+      if (value == null) return null
+      if (typeof value === 'object') return value as Record<string, unknown>
+      const raw = String(value).trim()
+      if (!raw) return null
+      try {
+        return JSON.parse(raw) as Record<string, unknown>
+      } catch {
+        return { raw }
+      }
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        l.id,
+        l.user_id AS userId,
+        l.action,
+        l.old_balance AS oldBalance,
+        l.new_balance AS newBalance,
+        l.amount,
+        l.metadata,
+        l.created_at AS createdAt,
+        u.name AS userName,
+        u.phone AS userPhone,
+        u.balance AS currentBalance
+      FROM logs l
+      LEFT JOIN users u ON u.id = l.user_id
+      WHERE l.action = 'cycle_capital_return_correction'
+      ORDER BY l.id DESC
+      LIMIT ?
+      `,
+      [limit]
+    )
+
+    const mapped = rows.map((row) => ({
+      id: Number(row.id),
+      userId: row.userId == null ? null : Number(row.userId),
+      userName: row.userName == null ? null : String(row.userName),
+      userPhone: row.userPhone == null ? null : String(row.userPhone),
+      currentBalance: row.currentBalance == null ? null : Number(row.currentBalance),
+      action: String(row.action ?? ''),
+      oldBalance: row.oldBalance == null ? null : Number(row.oldBalance),
+      newBalance: row.newBalance == null ? null : Number(row.newBalance),
+      amount: row.amount == null ? null : Number(row.amount),
+      metadata: parseMetadata(row.metadata),
+      createdAt: row.createdAt ? String(row.createdAt) : null,
+    }))
+
+    res.json({ ok: true, total: mapped.length, logs: mapped })
+  } catch (err) {
+    console.error('[admin-correction-logs]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao carregar logs de correção.' })
+  }
+})
+
 // ─── Security Logs endpoint ───────────────────────────────────────────────────
 app.get('/api/admin/security-logs', requireMaxAdmin, async (req, res) => {
   const rawLimit = Number(req.query.limit ?? 500)
