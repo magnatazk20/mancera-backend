@@ -12152,7 +12152,7 @@ app.post('/api/admin/deposits/:id/action', requireMaxAdmin, async (req, res) => 
 
 app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
   const rawLimit = Number(req.query.limit ?? 10)
-  const limit = Math.min(Math.max(rawLimit, 1), 50)
+  const limit = Math.min(Math.max(rawLimit, 1), 500)
 
   try {
     const [rows] = await pool.query<RowDataPacket[]>(
@@ -12161,6 +12161,12 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
         w.id,
         w.amount,
         w.status,
+        w.holder_name AS holderName,
+        w.holder_cpf AS holderCpf,
+        w.pix_key_type AS pixKeyType,
+        w.pix_key AS pixKey,
+        w.external_id AS externalId,
+        w.provider_transaction_id AS providerTransactionId,
         w.created_at AS createdAt,
         w.paid_at AS paidAt,
         u.id AS userId,
@@ -12178,6 +12184,12 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
       id: Number(row.id),
       amount: Number(row.amount ?? 0),
       status: String(row.status ?? 'pending').toLowerCase(),
+      holderName: String(row.holderName ?? ''),
+      holderCpf: String(row.holderCpf ?? ''),
+      pixKeyType: String(row.pixKeyType ?? ''),
+      pixKey: String(row.pixKey ?? ''),
+      externalId: row.externalId ? String(row.externalId) : null,
+      providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
       createdAt: row.createdAt,
       paidAt: row.paidAt,
       user: {
