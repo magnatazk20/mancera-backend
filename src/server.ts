@@ -2627,10 +2627,14 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 
     if (referralCode) {
       const [refRows] = await pool.query<RowDataPacket[]>(
-        'SELECT id FROM users WHERE referral_code = ? LIMIT 1',
+        'SELECT id, COALESCE(allow_referral_link, 1) AS allow_referral_link FROM users WHERE referral_code = ? LIMIT 1',
         [referralCode]
       )
       if (refRows.length > 0) {
+        if (Number(refRows[0].allow_referral_link ?? 1) === 0) {
+          res.status(403).json({ error: 'Este link de convite não está ativo no momento.' })
+          return
+        }
         referredByUserId = Number(refRows[0].id)
       }
     }
