@@ -4373,7 +4373,7 @@ app.get('/api/referral/:userId', async (req, res) => {
     }
 
     const appBaseUrl = process.env.APP_BASE_URL ?? 'http://localhost:5173'
-    const referralLink = `${appBaseUrl}/cadastro?ref=${encodeURIComponent(referralCode)}`
+    const referralLink = `${appBaseUrl}/register?ref=${encodeURIComponent(referralCode)}`
 
     res.json({
       ok: true,
