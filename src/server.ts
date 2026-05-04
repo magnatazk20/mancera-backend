@@ -2642,7 +2642,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       )
       const requiresInvite = Number(settingsRows[0]?.registrationRequiresInvite ?? 0) === 1
       if (requiresInvite && !referredByUserId) {
-        res.status(403).json({ error: 'Cadastro disponível apenas com link de convite de um usuário.' })
+        res.status(403).json({ error: 'Registration is only available with an invitation link from a user.' })
         return
       }
     } catch { /* se falhar, permite registro */ }
@@ -2653,8 +2653,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       .catch(() => null)
 
     // Inserir usuário com referral próprio e badge inicial "Estagiário"
+    await pool.query("ALTER TABLE users ADD COLUMN badge VARCHAR(50) NOT NULL DEFAULT 'Estagiário'").catch(() => null)
+    await pool.query("ALTER TABLE users ADD COLUMN allow_referral_link TINYINT(1) NOT NULL DEFAULT 1").catch(() => null)
     const [result] = await pool.query(
-      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id, badge) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id, badge, allow_referral_link) VALUES (?, ?, ?, ?, ?, ?, 1)',
       [name, normalizedPhone, hash, userReferralCode, referredByUserId, 'Estagiário']
     ) as any
 
@@ -14997,6 +14999,7 @@ app.get('/api/admin/users', requireMaxAdmin, async (_req, res) => {
         ref.id AS referrer_id,
         ref.name AS referrer_name,
         ref.phone AS referrer_phone,
+        COALESCE(u.allow_referral_link, 1) AS allow_referral_link,
         u.created_at
       FROM users u
       LEFT JOIN users ref ON ref.id = u.referred_by_user_id
@@ -15114,6 +15117,30 @@ app.patch('/api/admin/users/:id/ban', requireMaxAdmin, async (req, res) => {
   } catch (err) {
     console.error('[admin-users-ban]', err)
     res.status(500).json({ ok: false, error: 'Falha ao alterar banimento.' })
+  }
+})
+
+app.patch('/api/admin/users/:id/referral-link', requireMaxAdmin, async (req, res) => {
+  const userId = Number(req.params.id)
+  const allow = (req.body as { allow_referral_link?: number })?.allow_referral_link ? 1 : 0
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    await pool.query("ALTER TABLE users ADD COLUMN allow_referral_link TINYINT(1) NOT NULL DEFAULT 1").catch(() => null)
+    const [result] = await pool.query('UPDATE users SET allow_referral_link = ? WHERE id = ?', [allow, userId])
+    const affected = Number((result as { affectedRows?: number }).affectedRows ?? 0)
+    if (affected === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+    res.json({ ok: true, message: allow ? 'Link de convite ativado.' : 'Link de convite desativado.' })
+  } catch (err) {
+    console.error('[admin-users-referral-link]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao alterar permissão.' })
   }
 })
 
