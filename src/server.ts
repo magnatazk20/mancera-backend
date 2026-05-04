@@ -10728,33 +10728,7 @@ const ensureMonthlySalaryPlansTable = async () => {
     ADD KEY idx_monthly_salary_plans_sort (sort_order)
   `)
 
-  const [countRows] = await pool.query<RowDataPacket[]>(
-    `
-    SELECT COUNT(*) AS total
-    FROM monthly_salary_plans
-    `
-  )
-
-  const total = Number(countRows[0]?.total ?? 0)
-  if (total === 0) {
-    await pool.query(
-      `
-      INSERT INTO monthly_salary_plans
-      (
-        title,
-        monthly_salary,
-        required_level1_deposited,
-        required_level2_deposited,
-        required_level3_deposited,
-        is_active,
-        sort_order
-      )
-      VALUES
-      ('Start V1', 100.00, 100, 0, 0, 1, 1)
-      `
-    )
   }
-}
 
 const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depositorUserId: number, depositAmount: number) => {
   const parsedPaymentId = Number(cashinPaymentId)
