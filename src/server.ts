@@ -5495,6 +5495,7 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
     }
 
     if (currentWalletBalance < levelPrice) {
+      void logSecurityEvent({ eventType: 'insufficient_balance', req, userId: userId ? Number(userId) : null, httpStatus: 400, reason: `Tentativa de ativar VIP sem saldo. Necessário: R$ ${levelPrice.toFixed(2)}, disponível: R$ ${currentWalletBalance.toFixed(2)}` })
       res.status(400).json({
         ok: false,
         error: `Saldo insuficiente na carteira selecionada para ativar este VIP. Necessário: R$ ${levelPrice.toFixed(2).replace('.', ',')}, disponível: R$ ${currentWalletBalance.toFixed(2).replace('.', ',')}`,
@@ -6777,6 +6778,7 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
 
     if (userBalance < amount) {
       await conn.rollback()
+      void logSecurityEvent({ eventType: 'insufficient_balance', req, userId: parsedUserId, httpStatus: 400, reason: `Tentativa de comprar cycle sem saldo. Necessário: R$ ${amount}, disponível: R$ ${userBalance}` })
       res.status(400).json({
         ok: false,
         error: 'Saldo insuficiente para adquirir este ciclo.',
