@@ -997,7 +997,7 @@ const processTelegramUpdates = async () => {
           await sendTelegramMessage(
             botToken,
             chatId,
-            `⚠️ Lembrete ${usernameValue} Você ainda não vinculou sua conta PGLM e não pode receber recompensas de check-in! Clique no botão abaixo para vincular`,
+            `⚠️ Lembrete ${usernameValue} You haven't linked your account yet.`,
             {
               ...(botUrl
                 ? {
@@ -3512,7 +3512,7 @@ app.post('/api/shop/deposit', requireAuth, async (req: AuthenticatedRequest, res
       customerDocument:     '11615845445',
       customerDocumentType: 'cpf',
       customerPhone:        (user.phone || '').replace(/\D/g, '') || '11999998888',
-      description:          `Depósito loja PGLM - usuário #${user.id}`,
+      description:          `Depósito loja TRK - usuário #${user.id}`,
       callbackUrl:          `https://api.pgl-m.com/api/shop/deposit/webhook`,
       metadata: { userId: user.id, source: 'loja' },
     }
