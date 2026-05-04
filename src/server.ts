@@ -13,6 +13,10 @@ import type { NextFunction, Request, Response } from 'express'
 import type { RowDataPacket, ResultSetHeader } from 'mysql2'
 import mysql from 'mysql2/promise'
 
+// Bloqueia requisições simultâneas de completação (mesmo user + task)
+// Mapa: key = `${userId}:${taskId}`, value = true
+const pendingCompletions = new Map<string, boolean>()
+
 dotenv.config()
 
 const app  = express()
@@ -6362,6 +6366,14 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
     return
   }
 
+  // ── Bloqueio: impede que a mesma task seja completada simultaneamente ──
+  const lockKey = `${parsedUserId}:${parsedTaskId}`
+  if (pendingCompletions.get(lockKey)) {
+    res.status(429).json({ ok: false, error: 'Tarefa já está sendo processada. Aguarde.' })
+    return
+  }
+  pendingCompletions.set(lockKey, true)
+
   try {
     const [users] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM users WHERE id = ? LIMIT 1',
@@ -6369,6 +6381,7 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
     )
 
     if (users.length === 0) {
+      pendingCompletions.delete(lockKey)
       res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
       return
     }
@@ -6574,6 +6587,8 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
   } catch (err) {
     console.error('[mining-task-complete]', err)
     res.status(500).json({ ok: false, error: 'Erro interno ao completar tarefa.' })
+  } finally {
+    pendingCompletions.delete(lockKey)
   }
 })
 
