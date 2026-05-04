@@ -17664,7 +17664,7 @@ app.get('/api/admin/shop/products/:id/codes/count', requireMaxAdmin, async (req,
 // ─── 404 — rota não encontrada ───────────────────────────────────────────────
 app.use((req, res) => {
   console.warn(`[404] ${req.method} ${req.originalUrl} — rota não encontrada`)
-  res.status(404).json({ ok: false, error: `Rota não encontrada: ${req.method} ${req.originalUrl}` })
+  res.status(404).json({ ok: false, error: `未找到路线: ${req.method} ${req.originalUrl}` })
 })
 
 // ─── Erro global — captura qualquer exceção não tratada nas rotas ─────────────
