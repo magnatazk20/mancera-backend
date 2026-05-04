@@ -23,6 +23,24 @@ const io = new SocketIOServer(httpServer, {
     methods: ['GET', 'POST'],
   },
 })
+
+// Mapa de sockets conectados por userId — usado para desconectar ao banir
+const connectedSockets = new Map<number, Set<string>>()
+
+io.on('connection', (socket) => {
+  const userId = Number(socket.handshake.auth?.userId ?? 0)
+  if (userId > 0) {
+    if (!connectedSockets.has(userId)) connectedSockets.set(userId, new Set())
+    connectedSockets.get(userId)!.add(socket.id)
+  }
+  socket.on('disconnect', () => {
+    if (userId > 0) {
+      connectedSockets.get(userId)?.delete(socket.id)
+      if (connectedSockets.get(userId)?.size === 0) connectedSockets.delete(userId)
+    }
+  })
+})
+
 const PORT = process.env.PORT     ?? 3333
 const JWT_SECRET   = process.env.JWT_SECRET   ?? 'fallback_secret'
 const JWT_EXPIRES  = process.env.JWT_EXPIRES_IN ?? '7d'
@@ -15122,6 +15140,18 @@ app.patch('/api/admin/users/:id/ban', requireMaxAdmin, async (req, res) => {
     if (affected === 0) {
       res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
       return
+    }
+
+    // Se está banindo, desconecta o usuário de todos os sockets em tempo real
+    if (isBanned === 1) {
+      const sockets = connectedSockets.get(userId)
+      if (sockets) {
+        for (const socketId of sockets) {
+          io.to(socketId).emit('force-logout', { reason: 'account_banned' })
+          io.to(socketId).disconnectSockets(true)
+        }
+        connectedSockets.delete(userId)
+      }
     }
 
     res.json({ ok: true, message: isBanned ? 'Usuário banido.' : 'Usuário desbanido.' })
