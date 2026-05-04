@@ -15123,9 +15123,9 @@ app.patch('/api/admin/users/:id/ban', requireMaxAdmin, async (req, res) => {
     await pool.query(
       `
       ALTER TABLE users
-      ADD COLUMN IF NOT EXISTS is_banned TINYINT(1) NOT NULL DEFAULT 0
+      ADD COLUMN is_banned TINYINT(1) NOT NULL DEFAULT 0
       `
-    )
+    ).catch(() => null)
 
     const [result] = await pool.query(
       `
