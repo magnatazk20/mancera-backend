@@ -6146,6 +6146,41 @@ app.post('/api/admin/vip-refunds/:id/reject', requireMaxAdmin, async (req: Authe
   }
 })
 
+// Deletar VIP ativo de um usuário
+app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT uv.id, uv.vip_level_id AS vipLevelId, vl.name AS levelName
+       FROM user_vips uv
+       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+       WHERE uv.user_id = ? AND uv.status = 'active'
+       LIMIT 1`,
+      [userId]
+    )
+
+    if (rows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não possui VIP ativo para remover.' })
+      return
+    }
+
+    await pool.query(
+      `UPDATE user_vips SET status = 'inactive' WHERE user_id = ? AND status = 'active'`,
+      [userId]
+    )
+
+    res.json({ ok: true, message: `VIP '${rows[0].levelName}' removido com sucesso.` })
+  } catch (err) {
+    console.error('[admin-user-vip-delete]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao remover VIP do usuário.' })
+  }
+})
+
 // Histórico das tarefas de mineração concluídas pelo usuário
 app.get('/api/mining/history/:userId', async (req, res) => {
   const userId = Number(req.params.userId)
