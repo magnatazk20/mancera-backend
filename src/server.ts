@@ -15542,8 +15542,8 @@ app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: Authentica
         'user',
         userId,
         action,
-        Number(currentBalance.toFixed(2)),
-        nextBalance,
+        Number(currentWalletBalance.toFixed(2)),
+        nextWalletBalance,
         roundedAmount,
         JSON.stringify({
           adminId: Number(req.authUser?.id ?? 0),
