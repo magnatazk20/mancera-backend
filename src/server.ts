@@ -6146,7 +6146,7 @@ app.post('/api/admin/vip-refunds/:id/reject', requireMaxAdmin, async (req: Authe
   }
 })
 
-// Deletar VIP ativo de um usuário
+// Deletar VIP específico de um usuário
 app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.userId)
   if (!userId || Number.isNaN(userId)) {
@@ -6154,37 +6154,31 @@ app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: Authenti
     return
   }
 
+  const { vipId } = req.body as { vipId?: number }
+  if (!vipId || Number.isNaN(vipId)) {
+    res.status(400).json({ ok: false, error: 'ID do VIP inválido.' })
+    return
+  }
+
   try {
-    // Find active (not expired) VIP for this user
+    // Verify this VIP belongs to this user
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT uv.id, uv.vip_level_id AS vipLevelId, uv.expires_at, uv.status, vl.name AS levelName
+      `SELECT uv.id, vl.name AS levelName
        FROM user_vips uv
        INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
-       WHERE uv.user_id = ? AND uv.status = 'active'
-         AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
-       ORDER BY uv.id DESC
+       WHERE uv.id = ? AND uv.user_id = ?
        LIMIT 1`,
-      [userId]
+      [vipId, userId]
     )
 
-    console.log('[admin-user-vip-delete] userId:', userId, 'rows:', rows.length, rows[0] ?? 'none')
-
     if (rows.length === 0) {
-      // No active non-expired VIP found - just delete all active ones
-      await pool.query(
-        `DELETE FROM user_vips WHERE user_id = ? AND status = 'active'`,
-        [userId]
-      )
-      res.json({ ok: true, message: 'VIP expirado deletado do banco.' })
+      res.status(404).json({ ok: false, error: 'VIP não encontrado para este usuário.' })
       return
     }
 
-    await pool.query(
-      `DELETE FROM user_vips WHERE id = ?`,
-      [rows[0].id]
-    )
+    await pool.query(`DELETE FROM user_vips WHERE id = ?`, [vipId])
 
-    res.json({ ok: true, message: `VIP '${rows[0].levelName}' removido com sucesso.` })
+    res.json({ ok: true, message: `VIP '${rows[0].levelName}' deletado com sucesso.` })
   } catch (err) {
     console.error('[admin-user-vip-delete]', err)
     res.status(500).json({ ok: false, error: 'Erro ao remover VIP do usuário.' })
