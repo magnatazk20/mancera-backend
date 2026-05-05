@@ -6155,24 +6155,31 @@ app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: Authenti
   }
 
   try {
+    // Find active (not expired) VIP for this user
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT uv.id, uv.vip_level_id AS vipLevelId, vl.name AS levelName
+      `SELECT uv.id, uv.vip_level_id AS vipLevelId, uv.expires_at, vl.name AS levelName
        FROM user_vips uv
        INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
        WHERE uv.user_id = ? AND uv.status = 'active'
          AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+       ORDER BY uv.id DESC
        LIMIT 1`,
       [userId]
     )
 
     if (rows.length === 0) {
-      res.status(404).json({ ok: false, error: 'Usuário não possui VIP ativo para remover.' })
+      // No active non-expired VIP found - just mark all active ones as inactive
+      await pool.query(
+        `UPDATE user_vips SET status = 'inactive' WHERE user_id = ? AND status = 'active'`,
+        [userId]
+      )
+      res.json({ ok: true, message: 'VIP inativos removidos.' })
       return
     }
 
     await pool.query(
-      `UPDATE user_vips SET status = 'inactive' WHERE user_id = ? AND status = 'active'`,
-      [userId]
+      `UPDATE user_vips SET status = 'inactive' WHERE id = ?`,
+      [rows[0].id]
     )
 
     res.json({ ok: true, message: `VIP '${rows[0].levelName}' removido com sucesso.` })
