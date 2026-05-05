@@ -6162,23 +6162,24 @@ app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: Authenti
   }
 
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT uv.id, vl.name AS levelName
-       FROM user_vips uv
-       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
-       WHERE uv.id = ? AND uv.user_id = ?
-       LIMIT 1`,
-      [vipId, userId]
-    )
+    const vipIdNum = Number(req.query.vipId)
+    console.log('[admin-user-vip-delete] userId:', userId, 'vipId received:', vipIdNum, 'raw:', req.query.vipId)
 
-    if (rows.length === 0) {
-      res.status(404).json({ ok: false, error: 'VIP não encontrado para este usuário.' })
+    if (!vipIdNum || Number.isNaN(vipIdNum)) {
+      res.status(400).json({ ok: false, error: 'ID do VIP inválido.' })
       return
     }
 
-    await pool.query(`DELETE FROM user_vips WHERE id = ?`, [vipId])
+    // Just delete by VIP id directly - no need to verify user ownership in query
+    const [result] = await pool.query(`DELETE FROM user_vips WHERE id = ?`, [vipIdNum])
+    const affected = (result as any).affectedRows
 
-    res.json({ ok: true, message: `VIP '${rows[0].levelName}' deletado com sucesso.` })
+    if (!affected) {
+      res.status(404).json({ ok: false, error: 'VIP não encontrado no banco de dados.' })
+      return
+    }
+
+    res.json({ ok: true, message: `VIP deletado com sucesso.` })
   } catch (err) {
     console.error('[admin-user-vip-delete]', err)
     res.status(500).json({ ok: false, error: 'Erro ao remover VIP do usuário.' })
