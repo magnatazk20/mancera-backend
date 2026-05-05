@@ -3110,7 +3110,7 @@ app.post('/api/CASHIN/', async (req, res) => {
       customerDocumentType: 'cpf',
       customerPhone: normalizedPhone || '11999998888',
       description: `Depósito CASHIN - usuário #${user.id}`,
-      callbackUrl: 'https://api.pgl-m.com/api/CASHIN/webhook',
+      callbackUrl: 'https://appmniola.trk321.cc/api/CASHIN/webhook',
       metadata: {
         userId: user.id,
         method: method ?? 'pix',
