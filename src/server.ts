@@ -15397,15 +15397,18 @@ app.delete('/api/admin/users/:id/withdraw-password', requireMaxAdmin, async (req
 
 app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.id)
-  const { amount, operation, reason } = (req.body ?? {}) as {
+  const { amount, operation, reason, wallet } = (req.body ?? {}) as {
     amount?: number | string
     operation?: 'add' | 'subtract'
     reason?: string
+    wallet?: string
   }
 
   const parsedAmount = Number(String(amount ?? '').replace(',', '.'))
   const parsedOperation = String(operation ?? '').trim() as 'add' | 'subtract'
   const parsedReason = String(reason ?? '').trim()
+  const allowedWallets = ['balance', 'commission_balance', 'recharge_balance']
+  const walletField = allowedWallets.includes(wallet ?? '') ? wallet! : 'balance'
 
   if (!userId || Number.isNaN(userId)) {
     res.status(400).json({ ok: false, error: 'ID inválido.' })
@@ -15450,7 +15453,7 @@ app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: Authentica
     )
 
     const [rows] = await conn.query<RowDataPacket[]>(
-      'SELECT id, balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE',
+      `SELECT id, balance, commission_balance, recharge_balance FROM users WHERE id = ? LIMIT 1 FOR UPDATE`,
       [userId]
     )
 
@@ -15460,30 +15463,26 @@ app.post('/api/admin/users/:id/balance', requireMaxAdmin, async (req: Authentica
       return
     }
 
-    const currentBalance = Number(rows[0].balance ?? 0)
+    const currentWalletBalance = Number(rows[0][walletField] ?? 0)
     const roundedAmount = Number(parsedAmount.toFixed(2))
-    const nextBalance =
+    const nextWalletBalance =
       parsedOperation === 'add'
-        ? Number((currentBalance + roundedAmount).toFixed(2))
-        : Number((currentBalance - roundedAmount).toFixed(2))
+        ? Number((currentWalletBalance + roundedAmount).toFixed(2))
+        : Number((currentWalletBalance - roundedAmount).toFixed(2))
 
-    if (parsedOperation === 'subtract' && nextBalance < 0) {
+    if (parsedOperation === 'subtract' && nextWalletBalance < 0) {
       await conn.rollback()
       res.status(400).json({
         ok: false,
         error: 'Saldo insuficiente para retirar esse valor.',
-        balance: currentBalance,
+        balance: currentWalletBalance,
       })
       return
     }
 
     await conn.query(
-      `
-      UPDATE users
-      SET balance = ?
-      WHERE id = ?
-      `,
-      [nextBalance, userId]
+      `UPDATE users SET ${walletField} = ? WHERE id = ?`,
+      [nextWalletBalance, userId]
     )
 
     const action = parsedOperation === 'add' ? 'admin_balance_add' : 'admin_balance_subtract'
