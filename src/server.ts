@@ -6168,17 +6168,17 @@ app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: Authenti
     )
 
     if (rows.length === 0) {
-      // No active non-expired VIP found - just mark all active ones as inactive
+      // No active non-expired VIP found - just delete all active ones
       await pool.query(
-        `UPDATE user_vips SET status = 'inactive' WHERE user_id = ? AND status = 'active'`,
+        `DELETE FROM user_vips WHERE user_id = ? AND status = 'active'`,
         [userId]
       )
-      res.json({ ok: true, message: 'VIP inativos removidos.' })
+      res.json({ ok: true, message: 'VIP expirado deletado do banco.' })
       return
     }
 
     await pool.query(
-      `UPDATE user_vips SET status = 'inactive' WHERE id = ?`,
+      `DELETE FROM user_vips WHERE id = ?`,
       [rows[0].id]
     )
 
