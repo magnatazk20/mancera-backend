@@ -15789,6 +15789,159 @@ app.get('/api/admin/correction-logs', requireMaxAdmin, async (req, res) => {
   }
 })
 
+// ─── Preview do estorno (lista usuários T0-Estágio) ─────────────────────────
+app.get('/api/admin/commission-reversal-preview', requireMaxAdmin, async (_req, res) => {
+  try {
+    const [t0UsersRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT DISTINCT uv.user_id AS userId, u.name, u.phone
+      FROM user_vips uv
+      INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      LEFT JOIN users u ON u.id = uv.user_id
+      WHERE uv.status = 'active'
+        AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+        AND uv.vip_level_id = 6
+      `
+    )
+    res.json({ ok: true, t0Users: t0UsersRows.map((r) => ({ userId: Number(r.userId), name: r.name, phone: r.phone })) })
+  } catch (err) {
+    console.error('[commission-reversal-preview]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar preview.' })
+  }
+})
+
+// ─── Estorno de Comissões Originating de T0-Estágio ─────────────────────────
+// Identifica e estorna todas as comissões de tarefas e depósitos geradas por
+// usuários T0-Estágio (vip_level_id = 6), restaurando commission_balance dos uplines.
+app.post('/api/admin/commission-reversal', requireMaxAdmin, async (req, res) => {
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+
+    // ── 1. Identifica usuários T0-Estágio ativos ──
+    const [t0UsersRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT DISTINCT uv.user_id AS userId
+      FROM user_vips uv
+      INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      WHERE uv.status = 'active'
+        AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+        AND uv.vip_level_id = 6
+      `
+    )
+    const t0UserIds = t0UsersRows.map((r) => Number(r.userId))
+
+    if (t0UserIds.length === 0) {
+      await conn.commit()
+      res.json({ ok: true, message: 'Nenhum usuário T0-Estágio encontrado.', revertedTasks: 0, revertedDeposits: 0, totalReverted: 0 })
+      return
+    }
+
+    // ── 2. Estorna comissões de TAREFAS (task_commission_payouts) ──
+    // Busca todos os payouts de tarefa onde o usuário que executou a tarefa é T0-Estágio
+    const [taskPayouts] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT tcp.id, tcp.task_user_id AS taskUserId, tcp.beneficiary_user_id AS beneficiaryUserId,
+             tcp.commission_amount AS commissionAmount, tcp.task_progress_id AS taskProgressId
+      FROM task_commission_payouts tcp
+      WHERE tcp.task_user_id IN (${t0UserIds.map(() => '?').join(',')})
+      `,
+      t0UserIds
+    )
+
+    let revertedTasks = 0
+    for (const payout of taskPayouts) {
+      const taskUserId = Number(payout.taskUserId)
+      const beneficiaryUserId = Number(payout.beneficiaryUserId)
+      const commissionAmount = Number(payout.commissionAmount)
+
+      // Restaura commission_balance do upline que recebeu indevidamente
+      await conn.query(
+        `UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`,
+        [commissionAmount, beneficiaryUserId]
+      )
+
+      // Log de estorno
+      await conn.query(
+        `INSERT INTO logs (user_id, entity_type, entity_id, action, amount, metadata)
+         VALUES (?, 'commission', ?, 'commission_reversal', ?, ?)`,
+        [
+          beneficiaryUserId,
+          payout.taskProgressId,
+          -commissionAmount,
+          JSON.stringify({ source: 'task', taskProgressId: payout.taskProgressId, reversedFromTaskUserId: taskUserId, originalPayoutId: payout.id }),
+        ]
+      )
+
+      revertedTasks++
+    }
+
+    // ── 3. Estorna comissões de DEPÓSITOS (commission_payouts) ──
+    const [depositPayouts] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT cp.id, cp.depositor_user_id AS depositorUserId, cp.beneficiary_user_id AS beneficiaryUserId,
+             cp.commission_amount AS commissionAmount, cp.cashin_payment_id AS cashinPaymentId
+      FROM commission_payouts cp
+      WHERE cp.depositor_user_id IN (${t0UserIds.map(() => '?').join(',')})
+      `,
+      t0UserIds
+    )
+
+    let revertedDeposits = 0
+    for (const payout of depositPayouts) {
+      const depositorUserId = Number(payout.depositorUserId)
+      const beneficiaryUserId = Number(payout.beneficiaryUserId)
+      const commissionAmount = Number(payout.commissionAmount)
+
+      await conn.query(
+        `UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`,
+        [commissionAmount, beneficiaryUserId]
+      )
+
+      await conn.query(
+        `INSERT INTO logs (user_id, entity_type, entity_id, action, amount, metadata)
+         VALUES (?, 'commission', ?, 'commission_reversal', ?, ?)`,
+        [
+          beneficiaryUserId,
+          payout.cashinPaymentId,
+          -commissionAmount,
+          JSON.stringify({ source: 'deposit', cashinPaymentId: payout.cashinPaymentId, reversedFromDepositorUserId: depositorUserId, originalPayoutId: payout.id }),
+        ]
+      )
+
+      revertedDeposits++
+    }
+
+    // ── 4. Log geral do estorno ──
+    const totalReverted = taskPayouts.reduce((acc, p) => acc + Number(p.commissionAmount), 0) +
+                          depositPayouts.reduce((acc, p) => acc + Number(p.commissionAmount), 0)
+
+    await conn.query(
+      `INSERT INTO logs (user_id, entity_type, entity_id, action, amount, metadata)
+       VALUES (NULL, 'admin', NULL, 'commission_reversal_exec', ?, ?)`,
+      [
+        totalReverted,
+        JSON.stringify({ revertedTasks, revertedDeposits, totalReverted, t0UserCount: t0UserIds.length, t0UserIds }),
+      ]
+    )
+
+    await conn.commit()
+    res.json({
+      ok: true,
+      message: `Estorno concluído. ${t0UserIds.length} usuário(s) T0-Estágio processado(s).`,
+      revertedTasks,
+      revertedDeposits,
+      totalReverted,
+    })
+  } catch (err) {
+    await conn.rollback()
+    console.error('[admin-commission-reversal]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao executar estorno de comissões.' })
+  } finally {
+    conn.release()
+  }
+})
+
 // ─── Security Logs endpoint ───────────────────────────────────────────────────
 app.get('/api/admin/security-logs', requireMaxAdmin, async (req, res) => {
   const rawLimit = Number(req.query.limit ?? 500)
