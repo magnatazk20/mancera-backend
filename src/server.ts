@@ -10068,6 +10068,14 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
 app.post('/api/withdraw/webhook', async (req, res) => {
   const ip = String(req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? 'ip-desconhecido')
 
+  // Log imediato de todo webhook recebido
+  console.log('========================================')
+  console.log('[withdraw-webhook] ★ WEBHOOK RECEBIDO DA LUMOPAY')
+  console.log('[withdraw-webhook] IP:', ip)
+  console.log('[withdraw-webhook] HEADERS:', JSON.stringify(req.headers, null, 2))
+  console.log('[withdraw-webhook] BODY RAW:', JSON.stringify(req.body, null, 2))
+  console.log('========================================')
+
   // Formato Lumopay cashout (webhook PHP legado):
   // { idTransaction, status, type, amount, net_amount, fee, pix_key, pix_type, paid_at, failed_at }
   const payload = (req.body ?? {}) as {
@@ -10275,7 +10283,7 @@ app.post('/api/withdraw/webhook', async (req, res) => {
     const currentStatus = String(foundWithdrawal.status ?? '').toLowerCase()
     const withdrawalAmount = Number(foundWithdrawal.amount ?? 0)
 
-    console.log('[withdraw-webhook] saque encontrado', {
+    console.log('[withdraw-webhook] ★ SAQUE ENCONTRADO', {
       matchStrategy,
       withdrawalId,
       userId,
@@ -10343,13 +10351,14 @@ app.post('/api/withdraw/webhook', async (req, res) => {
 
       await conn.commit()
 
-      console.log('[withdraw-webhook] atualizado com sucesso', {
+      console.log('[withdraw-webhook] ★ SUCESSO — saque atualizado', {
         withdrawalId,
         previousStatus: currentStatus,
         newStatus: normalizedStatus,
         providerTransactionId,
         externalId,
         matchStrategy,
+        refunded: shouldRefund,
       })
 
       res.json({
