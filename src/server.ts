@@ -9386,11 +9386,16 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     return
   }
 
-  const { userId, amount, withdrawPassword } = req.body as {
+  const { userId, amount, withdrawPassword, walletType } = req.body as {
     userId?: unknown
     amount?: unknown
     withdrawPassword?: unknown
+    walletType?: unknown
   }
+
+  // ── Determina qual carteira usar: 'balance' ou 'commission' ──
+  const parsedWalletType = String(walletType ?? 'balance').trim().toLowerCase()
+  const isCommissionWallet = parsedWalletType === 'commission'
 
   // ── Segurança: userId deve ser inteiro positivo ──
   const parsedUserId = Number(userId)
@@ -9474,7 +9479,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
 
     const [users] = await conn.query<RowDataPacket[]>(
       `
-      SELECT id, balance, withdraw_password AS withdrawPassword
+      SELECT id, balance, commission_balance AS commissionBalance, withdraw_password AS withdrawPassword
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -9596,7 +9601,10 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     const holderCpf = String(pixRows[0].holderCpf ?? '').replace(/\D/g, '')
     const pixKeyType = normalizePixType(String(pixRows[0].pixKeyType ?? 'CHAVE_ALEATORIA'))
     const pixKey = normalizePixKey(String(pixRows[0].pixKey ?? ''), pixKeyType)
-    const currentBalance = Number(users[0].balance ?? 0)
+    // Usa o saldo da carteira correta: commission ou balance padrão
+    const currentBalance = isCommissionWallet
+      ? Number(users[0].commissionBalance ?? 0)
+      : Number(users[0].balance ?? 0)
 
     if (!holderName || holderCpf.length !== 11 || !pixKey) {
       await conn.rollback()
@@ -9753,20 +9761,30 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
       return
     }
 
-    await conn.query(
-      `
-      UPDATE users
-      SET
-        balance = ?,
-        commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
-        recharge_balance = GREATEST(
-          COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
-          0
-        )
-      WHERE id = ?
-      `,
-      [newBalance, safeAmount, safeAmount, parsedUserId]
-    )
+    // ── Desconta da carteira correta ──
+    if (isCommissionWallet) {
+      // Desconta apenas da commission_balance
+      await conn.query(
+        `UPDATE users SET commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0) WHERE id = ?`,
+        [safeAmount, parsedUserId]
+      )
+    } else {
+      // Desconte da balance, usando commission_balance como auxílio (lógica original)
+      await conn.query(
+        `
+        UPDATE users
+        SET
+          balance = ?,
+          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
+          recharge_balance = GREATEST(
+            COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
+            0
+          )
+        WHERE id = ?
+        `,
+        [newBalance, safeAmount, safeAmount, parsedUserId]
+      )
+    }
 
     const externalId = `WD-${Date.now()}-${parsedUserId}`
     let withdrawStatus: 'pending' | 'processing' | 'paid' | 'failed' = 'pending'
