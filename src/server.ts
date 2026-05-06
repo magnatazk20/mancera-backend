@@ -4368,6 +4368,64 @@ Agora ele receberá um salario mensal de ${monthlySalaryFormatted} em sua conta 
   }
 })
 
+// ─── Meta info for referral link preview (OG tags) ─────────────────────────
+app.get('/api/register/meta/:ref', async (req, res) => {
+  const refCode = String(req.params.ref ?? '').trim().toUpperCase()
+  if (!refCode) {
+    res.status(400).json({ ok: false, error: 'Código de convite não fornecido.' })
+    return
+  }
+  try {
+    const [userRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT u.id, u.name, vl.name AS vipName, vl.price AS vipPrice
+      FROM users u
+      LEFT JOIN user_vips uv ON uv.user_id = u.id AND uv.status = 'active'
+        AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+      LEFT JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      WHERE u.referral_code = ?
+      LIMIT 1
+      `,
+      [refCode]
+    )
+    if (userRows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Código de convite não encontrado.' })
+      return
+    }
+    const inviterName = String(userRows[0].name ?? '').split(' ')[0]
+    const vipName = userRows[0].vipName ? String(userRows[0].vipName) : null
+    const vipPrice = Number(userRows[0].vipPrice ?? 0)
+    const isPaidVip = vipPrice > 0
+
+    const [siteRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(site_logo_url, '') AS siteLogoUrl, COALESCE(site_title, '') AS siteTitle FROM site_settings ORDER BY id ASC LIMIT 1`
+    )
+    const siteLogo = String(siteRows[0]?.siteLogoUrl ?? '')
+    const siteTitle = String(siteRows[0]?.siteTitle ?? 'TRK')
+
+    const ogTitle = isPaidVip && vipName
+      ? `${inviterName} te convida para o VIP ${vipName} | ${siteTitle}`
+      : `${inviterName} te convida para a TRK | ${siteTitle}`
+    const ogDescription = isPaidVip && vipName
+      ? `收到来自 VIP ${vipName} 的邀请。立即加入并享受独家福利！`
+      : `收到了一个邀请。立即加入 TRK 平台！`
+
+    res.json({
+      ok: true,
+      inviterName,
+      vipName,
+      vipPrice,
+      isPaidVip,
+      ogTitle,
+      ogDescription,
+      siteLogo,
+    })
+  } catch (err) {
+    console.error('[register-meta]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar meta do convite.' })
+  }
+})
+
 app.get('/api/referral/:userId', async (req, res) => {
   const userId = Number(req.params.userId)
 
