@@ -6154,6 +6154,10 @@ app.get('/api/admin/vip-users', requireMaxAdmin, async (req, res) => {
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)))
     const offset = (page - 1) * limit
 
+    // Garante que as colunas existem
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00`).catch(() => {})
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS recharge_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00`).catch(() => {})
+
     const [countRows] = await pool.query<RowDataPacket[]>(
       `
       SELECT COUNT(DISTINCT uv.user_id) AS total
@@ -6212,7 +6216,8 @@ app.get('/api/admin/vip-users', requireMaxAdmin, async (req, res) => {
     res.json({ ok: true, total, page, limit, users })
   } catch (err) {
     console.error('[admin-vip-users]', err)
-    res.status(500).json({ ok: false, error: 'Erro ao carregar lista de usuários VIP.' })
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar lista de usuários VIP.', details: message })
   }
 })
 app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
