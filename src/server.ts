@@ -6146,7 +6146,75 @@ app.post('/api/admin/vip-refunds/:id/reject', requireMaxAdmin, async (req: Authe
   }
 })
 
-// Deletar VIP específico de um usuário
+// ─── Lista de usuários com VIP comprado e seus saldos ──────────────────────
+app.get('/api/admin/vip-users', requireMaxAdmin, async (req, res) => {
+  try {
+    const search = String(req.query.search ?? '').trim()
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)))
+    const offset = (page - 1) * limit
+
+    const [countRows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT COUNT(DISTINCT uv.user_id) AS total
+      FROM user_vips uv
+      INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      WHERE uv.status = 'active'
+        AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+        AND vl.price > 0
+      `
+    )
+    const total = Number(countRows[0]?.total ?? 0)
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        u.id AS userId,
+        u.name,
+        u.phone,
+        vl.name AS vipName,
+        vl.level AS vipLevel,
+        vl.price AS vipPrice,
+        COALESCE(u.balance, 0) AS balance,
+        COALESCE(u.commission_balance, 0) AS commissionBalance,
+        COALESCE(u.recharge_balance, 0) AS rechargeBalance,
+        uv.started_at AS vipStartedAt,
+        uv.expires_at AS vipExpiresAt,
+        u.created_at AS userCreatedAt
+      FROM user_vips uv
+      INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
+      INNER JOIN users u ON u.id = uv.user_id
+      WHERE uv.status = 'active'
+        AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+        AND vl.price > 0
+        ${search ? 'AND (u.name LIKE ? OR u.phone LIKE ?)' : ''}
+      ORDER BY u.id DESC
+      LIMIT ? OFFSET ?
+      `,
+      search ? [`%${search}%`, `%${search}%`, limit, offset] : [limit, offset]
+    )
+
+    const users = rows.map((row) => ({
+      userId: Number(row.userId),
+      name: String(row.name ?? ''),
+      phone: String(row.phone ?? ''),
+      vipName: String(row.vipName ?? ''),
+      vipLevel: Number(row.vipLevel ?? 0),
+      vipPrice: Number(row.vipPrice ?? 0),
+      balance: Number(row.balance ?? 0),
+      commissionBalance: Number(row.commissionBalance ?? 0),
+      rechargeBalance: Number(row.rechargeBalance ?? 0),
+      vipStartedAt: row.vipStartedAt ? String(row.vipStartedAt) : null,
+      vipExpiresAt: row.vipExpiresAt ? String(row.vipExpiresAt) : null,
+      userCreatedAt: row.userCreatedAt ? String(row.userCreatedAt) : null,
+    }))
+
+    res.json({ ok: true, total, page, limit, users })
+  } catch (err) {
+    console.error('[admin-vip-users]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar lista de usuários VIP.' })
+  }
+})
 app.delete('/api/admin/users/:userId/vip', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
   const userId = Number(req.params.userId)
   const vipId = Number(req.query.vipId)
