@@ -5743,24 +5743,19 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
         [parsedUserId]
       )
 
-      // Deduct from all wallets that have balance (in order: recharge -> commission -> balance)
-      const balanceFields: Array<{ field: string; value: number }> = [
-        { field: 'recharge_balance', value: Number(users[0].recharge_balance ?? 0) },
-        { field: 'commission_balance', value: Number(users[0].commission_balance ?? 0) },
-        { field: 'balance', value: Number(users[0].balance ?? 0) },
-      ]
+      // Desconta SOMENTE da carteira selecionada pelo usuário
+      const walletBalance = Number(users[0][walletField] ?? 0)
 
-      let remainingToDeduct = levelPrice
-      for (const wf of balanceFields) {
-        if (remainingToDeduct <= 0) break
-        if (wf.value <= 0) continue
-        const deducted = Math.min(wf.value, remainingToDeduct)
-        await conn.query(`UPDATE users SET ${wf.field} = COALESCE(${wf.field}, 0) - ? WHERE id = ?`, [deducted, parsedUserId])
-        remainingToDeduct -= deducted
-      }
-
-      if (remainingToDeduct > 0) {
-        throw new Error('Saldo insuficiente mesmo combinando todas as carteiras.')
+      let balanceAfter = walletBalance
+      if (walletField === 'balance') {
+        await conn.query(`UPDATE users SET balance = COALESCE(balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+        balanceAfter = walletBalance - levelPrice
+      } else if (walletField === 'commission_balance') {
+        await conn.query(`UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+        balanceAfter = walletBalance - levelPrice
+      } else if (walletField === 'recharge_balance') {
+        await conn.query(`UPDATE users SET recharge_balance = COALESCE(recharge_balance, 0) - ? WHERE id = ?`, [levelPrice, parsedUserId])
+        balanceAfter = walletBalance - levelPrice
       }
 
       await conn.query(
@@ -5803,7 +5798,7 @@ app.post('/api/vip/activate', requireAuth, async (req: AuthenticatedRequest, res
         )
         VALUES (?, ?, ?, ?, ?)
         `,
-        [parsedUserId, parsedVipLevelId, levelPrice, currentWalletBalance, currentWalletBalance - levelPrice]
+        [parsedUserId, parsedVipLevelId, levelPrice, walletBalance, balanceAfter]
       )
 
       const purchaseId = purchaseResult.insertId
