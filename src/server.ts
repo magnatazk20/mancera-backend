@@ -14602,6 +14602,12 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
   const limit = Math.min(Math.max(rawLimit, 1), 500)
 
   try {
+    // Busca taxa configurada
+    const [configRows] = await pool.query<RowDataPacket[]>(
+      `SELECT withdraw_fee_percent AS withdrawFeePercent FROM system_withdraw_config ORDER BY id ASC LIMIT 1`
+    )
+    const configuredFeePercent = Number(configRows[0]?.withdrawFeePercent ?? 0)
+
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
@@ -14627,24 +14633,32 @@ app.get('/api/admin/withdrawals/latest', requireMaxAdmin, async (req, res) => {
       [limit]
     )
 
-    const withdrawals = rows.map((row) => ({
-      id: Number(row.id),
-      amount: Number(row.amount ?? 0),
-      status: String(row.status ?? 'pending').toLowerCase(),
-      holderName: String(row.holderName ?? ''),
-      holderCpf: String(row.holderCpf ?? ''),
-      pixKeyType: String(row.pixKeyType ?? ''),
-      pixKey: String(row.pixKey ?? ''),
-      externalId: row.externalId ? String(row.externalId) : null,
-      providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
-      createdAt: row.createdAt,
-      paidAt: row.paidAt,
-      user: {
-        id: Number(row.userId),
-        name: String(row.userName ?? 'Usuário'),
-        phone: String(row.userPhone ?? ''),
-      },
-    }))
+    const withdrawals = rows.map((row) => {
+      const amount = Number(row.amount ?? 0)
+      const feeAmount = Number(((amount * configuredFeePercent) / 100).toFixed(2))
+      const netAmount = Number((amount - feeAmount).toFixed(2))
+      return {
+        id: Number(row.id),
+        amount,
+        feePercent: configuredFeePercent,
+        feeAmount,
+        netAmount,
+        status: String(row.status ?? 'pending').toLowerCase(),
+        holderName: String(row.holderName ?? ''),
+        holderCpf: String(row.holderCpf ?? ''),
+        pixKeyType: String(row.pixKeyType ?? ''),
+        pixKey: String(row.pixKey ?? ''),
+        externalId: row.externalId ? String(row.externalId) : null,
+        providerTransactionId: row.providerTransactionId ? String(row.providerTransactionId) : null,
+        createdAt: row.createdAt,
+        paidAt: row.paidAt,
+        user: {
+          id: Number(row.userId),
+          name: String(row.userName ?? 'Usuário'),
+          phone: String(row.userPhone ?? ''),
+        },
+      }
+    })
 
     res.json({
       ok: true,
