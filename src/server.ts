@@ -7037,6 +7037,22 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
     return
   }
 
+  // ── Verificar se o usuário é T0 (VIP padrão) — não pode comprar cycle products ──
+  const [vipCheckRows] = await pool.query<RowDataPacket[]>(
+    `SELECT uv.vip_level_id AS vipLevelId, vl.name AS vipName
+     FROM user_vips uv
+     JOIN vip_levels vl ON vl.id = uv.vip_level_id
+     WHERE uv.user_id = ? AND uv.status = 'active' AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
+     LIMIT 1`,
+    [parsedUserId]
+  )
+  const vipLevelId = Number(vipCheckRows[0]?.vipLevelId ?? 0)
+  // T0 = vip_level_id = 6 (valor padrão do sistema)
+  if (vipLevelId === 6) {
+    res.status(403).json({ ok: false, error: 'Planos de ciclo são exclusivos para membros T1 em diante. Faça um depósito para ativar sua conta.' })
+    return
+  }
+
   if (!parsedCycleProductId || Number.isNaN(parsedCycleProductId)) {
     res.status(400).json({ ok: false, error: 'ID do produto de ciclo inválido.' })
     return
