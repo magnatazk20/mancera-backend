@@ -68,6 +68,19 @@ const getSaoPauloDateString = () =>
     day: '2-digit',
   }).format(new Date())
 
+// Retorna true se for domingo em São Paulo (horário de Brasília)
+const isSundayInSaoPaulo = (): boolean => {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: SAO_PAULO_TZ,
+    weekday: 'long',
+  })
+  const day = formatter.format(new Date())
+  return day === 'Sunday';
+}
+
+// T1+ = qualquer VIP exceto T0 (vip_level_id = 6)
+const isT1OrHigher = (vipLevelId: number): boolean => vipLevelId !== 6
+
 const normalizePixType = (pixTypeRaw: string) => {
   const type = String(pixTypeRaw ?? '').trim().toUpperCase()
   const allowed = ['CPF', 'CNPJ', 'EMAIL', 'TELEFONE', 'CHAVE_ALEATORIA'] as const
@@ -6595,7 +6608,12 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
     )
 
     const totalCompletedToday = Number(dailyRows[0]?.totalCompletedToday ?? 0)
-    const remainingByVip = Math.max(vipDailyTaskLimit - totalCompletedToday, 0)
+    const isSunday = isSundayInSaoPaulo()
+    const isT1Plus = isT1OrHigher(Number(vip.vipLevelId))
+    const tasksLocked = isSunday && isT1Plus
+
+    // T1+ não faz tarefas aos domingos — força limite restante = 0
+    const remainingByVip = tasksLocked ? 0 : Math.max(vipDailyTaskLimit - totalCompletedToday, 0)
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `
@@ -6619,13 +6637,16 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
     const rewardAmount = Number(vipRewardAmount.toFixed(2))
 
     const tasks = rows.map((task) => {
+      // T1+ aos domingos: marca todas as tarefas como já concluídas (sem ganho)
+      const completedToday = tasksLocked ? Number(vipDailyTaskLimit) : Number(task.completedToday ?? 0)
+      const earnedToday = tasksLocked ? 0 : Number(task.earnedToday ?? 0)
       return {
         id: Number(task.id),
         name: String(task.name ?? ''),
         description: String(task.description ?? ''),
         dailyLimit: vipDailyTaskLimit,
-        completedToday: Number(task.completedToday ?? 0),
-        earnedToday: Number(task.earnedToday ?? 0),
+        completedToday,
+        earnedToday,
         rewardAmount,
         remainingToday: remainingByVip,
       }
@@ -6641,6 +6662,8 @@ app.get('/api/mining/tasks/:userId', async (req, res) => {
       },
       totalCompletedToday,
       remainingByVip,
+      isSunday,
+      tasksLocked,
       tasks,
     })
 
@@ -6729,6 +6752,17 @@ app.post('/api/mining/tasks/complete', requireAuth, async (req: AuthenticatedReq
     const vip = vipRows[0]
     const vipDailyTaskLimit = Number(vip.vipDailyTaskLimit ?? 0)
     const vipRewardAmount = Number(vip.vipRewardAmount ?? 0)
+
+    // T1+ não pode completar tarefas aos domingos
+    if (isSundayInSaoPaulo() && isT1OrHigher(Number(vip.vipLevelId))) {
+      pendingCompletions.delete(lockKey)
+      res.status(403).json({
+        ok: false,
+        error: 'As tarefas são realizadas de segunda a sábado.',
+        code: 'SUNDAY_BLOCKED',
+      })
+      return
+    }
 
     const saoPauloDate = getSaoPauloDateString()
 
