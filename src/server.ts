@@ -9968,6 +9968,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX auto #${externalId}`,
+        callbackUrl: 'https://appmniola.trk321.cc/api/withdraw/webhook',
       }
 
       const providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
@@ -14925,6 +14926,7 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX #${withdrawalId}`,
+        callbackUrl: 'https://appmniola.trk321.cc/api/withdraw/webhook',
       }
 
       const lumopayAbort = new AbortController()
