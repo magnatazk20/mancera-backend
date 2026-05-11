@@ -9965,15 +9965,24 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
         throw new Error(String(providerPayload?.message ?? providerPayload?.error ?? 'Falha ao processar saque automático na Lumopay.'))
       }
 
+      // UUID = transaction_id (novo campo Lumopay), fallback idTransaction (legado)
       providerTransactionId =
         String(
-          providerPayload?.data?.idTransaction ??
-          providerPayload?.data?.external_id ??
           providerPayload?.data?.transaction_id ??
+          providerPayload?.data?.idTransaction ??
           providerPayload?.transaction_id ??
           providerPayload?.idTransaction ??
           ''
         ).trim() || null
+
+      // external_id da Lumopay (saque_<timestamp>) — fallback de matching no webhook
+      const lumopayExternalId =
+        String(providerPayload?.data?.external_id ?? '').trim() || null
+
+      // Se não veio UUID, usa external_id como provider_transaction_id (fallback)
+      if (!providerTransactionId && lumopayExternalId) {
+        providerTransactionId = lumopayExternalId
+      }
 
       const providerStatusRaw = String(
         providerPayload?.data?.status ??
@@ -9987,7 +9996,13 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
           : providerStatusRaw === 'failed' || providerStatusRaw === 'canceled' || providerStatusRaw === 'cancelled'
             ? 'failed'
             : 'processing'
+
     }
+
+    // external_id a salvar no banco: prefere o da Lumopay (saque_<timestamp>), fallback no interno (WD-...)
+    const lumopayExtId =
+      String(providerPayload?.data?.external_id ?? '').trim() || null
+    const dbExternalId = lumopayExtId ?? externalId
 
     const [insertResult] = await conn.query(
       `
@@ -10016,7 +10031,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
         pixKey,
         providerTransactionId,
         withdrawStatus,
-        externalId,
+        dbExternalId,
         providerPayload ? JSON.stringify(providerPayload) : null,
         withdrawStatus === 'paid' ? new Date() : null,
       ]
@@ -14849,6 +14864,7 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
     const amount = Number(withdrawal.amount ?? 0)
     const userId = Number(withdrawal.userId)
     let providerTransactionId: string | null = null
+    let providerExternalId: string | null = null
     let providerResponsePayload: any = null
     let feePercent = 0
     let feeAmount = 0
@@ -14954,15 +14970,19 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
 
       console.log(`[admin-withdrawals-action] lumopay success, providerResponsePayload=`, providerResponsePayload)
 
+      // UUID = transaction_id (novo campo Lumopay), fallback idTransaction (legado)
       providerTransactionId =
         String(
-          providerResponsePayload?.data?.idTransaction ??
-          providerResponsePayload?.data?.external_id ??
           providerResponsePayload?.data?.transaction_id ??
+          providerResponsePayload?.data?.idTransaction ??
           providerResponsePayload?.transaction_id ??
           providerResponsePayload?.idTransaction ??
           ''
         ).trim() || null
+
+      // external_id separado (saque_<timestamp>) — usado pelo webhook como fallback de matching
+      providerExternalId =
+        String(providerResponsePayload?.data?.external_id ?? '').trim() || null
 
       const providerStatusRaw = String(
         providerResponsePayload?.data?.status ??
@@ -14976,6 +14996,11 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
           : providerStatusRaw === 'failed' || providerStatusRaw === 'canceled' || providerStatusRaw === 'cancelled'
             ? 'failed'
             : 'processing'
+
+      // Se não veio UUID, usa external_id como provider_transaction_id (fallback)
+      if (!providerTransactionId && providerExternalId) {
+        providerTransactionId = providerExternalId
+      }
     }
 
     await conn.query(
@@ -14986,6 +15011,10 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         provider_transaction_id = CASE
           WHEN ? IN ('processing', 'paid') THEN COALESCE(?, provider_transaction_id)
           ELSE provider_transaction_id
+        END,
+        external_id = CASE
+          WHEN ? IN ('processing', 'paid') THEN COALESCE(?, external_id)
+          ELSE external_id
         END,
         provider_payload = CASE
           WHEN ? IN ('processing', 'paid') THEN ?
@@ -14999,6 +15028,8 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         nextStatus,
         nextStatus,
         providerTransactionId,
+        nextStatus,
+        providerExternalId,
         nextStatus,
         parsedAction === 'approve'
           ? JSON.stringify({
