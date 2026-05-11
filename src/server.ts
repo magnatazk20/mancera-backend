@@ -1897,13 +1897,15 @@ const pollLumopayWithdrawals = async () => {
           continue
         }
 
-        const data = await getRes.json().catch(() => null)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data: any = await getRes.json().catch(() => null)
         if (!data?.success || !data?.data) {
           console.warn(`[lumopay-poll] withdrawal #${withdrawalId} tx=${txId} resposta inválida:`, data)
           continue
         }
 
-        const tx = data.data
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const tx: any = data.data
         const providerStatusRaw = String(tx.status ?? '').toLowerCase()
         const newStatus =
           providerStatusRaw === 'paid' || providerStatusRaw === 'payment.paid'
