@@ -1973,11 +1973,11 @@ const pollLumopayWithdrawals = async () => {
   }
 }
 
-// Polling removido — webhook /api/withdraw/webhook cuida da atualizacao de status
-// Mantido apenas como fallback para casos onde o webhook nao e chamado
-setInterval(pollLumopayWithdrawals, LUMOPAY_POLLING_INTERVAL_MS)
-pollLumopayWithdrawals() // executa uma vez imediatamente ao iniciar
-console.log(`[lumopay-poll] started — polling every ${LUMOPAY_POLLING_INTERVAL_MS / 1000}s (fallback)`)
+// Poll desativado — endpoint GET da Lumopay não existe (Route not found).
+// O webhook /api/withdraw/webhook (com callbackUrl no cashout) é o único mecanismo de atualização.
+// setInterval(pollLumopayWithdrawals, LUMOPAY_POLLING_INTERVAL_MS)
+// pollLumopayWithdrawals()
+console.log('[lumopay-poll] polling desativado — usando apenas webhook')
 
 // POST /api/presence/heartbeat — chamado pelo frontend a cada 30s
 app.post('/api/presence/heartbeat', (req, res) => {
