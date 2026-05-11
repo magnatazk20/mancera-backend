@@ -10004,7 +10004,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
   }
 })
 
-app.post('/api/withdraw/webhook', async (req, res) => {
+app.post(['/api/withdraw/webhook', '/withdraw/webhook'], async (req, res) => {
   const ip = String(req.headers['x-forwarded-for'] ?? req.socket.remoteAddress ?? 'ip-desconhecido')
 
   // Log imediato de todo webhook recebido
