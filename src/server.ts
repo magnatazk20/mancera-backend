@@ -4725,6 +4725,94 @@ app.post('/api/admin/cycles/retroactive-capital-fix', requireMaxAdmin, async (re
   }
 })
 
+// GET /api/admin/cycles/all
+// Lista todos os ciclos de todos os usuários, com filtro opcional por status.
+// query param ?status=active|completed|expired|all (default: all)
+// query param ?search=termo  — busca por nome ou telefone do usuário
+app.get('/api/admin/cycles/all', requireMaxAdmin, async (req, res) => {
+  const statusFilter = String((req.query as Record<string, string>).status ?? 'all').toLowerCase()
+  const search = String((req.query as Record<string, string>).search ?? '').trim()
+
+  try {
+    const now = new Date()
+
+    let whereClause = ''
+    const params: unknown[] = []
+
+    if (statusFilter === 'active') {
+      whereClause = 'WHERE ucp.status = \'active\' AND (ucp.ends_at IS NULL OR ucp.ends_at > NOW())'
+    } else if (statusFilter === 'completed') {
+      whereClause = 'WHERE ucp.status = \'completed\''
+    } else if (statusFilter === 'expired') {
+      // Ciclos com status active mas que já passaram da data de fim
+      whereClause = 'WHERE ucp.status = \'active\' AND ucp.ends_at IS NOT NULL AND ucp.ends_at <= NOW()'
+    }
+
+    if (search) {
+      const searchWild = `%${search}%`
+      whereClause = whereClause
+        ? `${whereClause} AND (u.name LIKE ? OR u.phone LIKE ?)`
+        : 'WHERE (u.name LIKE ? OR u.phone LIKE ?)'
+      params.push(searchWild, searchWild)
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        ucp.id,
+        ucp.user_id         AS userId,
+        ucp.amount_paid     AS amountPaid,
+        ucp.expected_profit AS expectedProfit,
+        ucp.cycle_days      AS cycleDays,
+        ucp.status,
+        ucp.started_at      AS startedAt,
+        ucp.ends_at         AS endsAt,
+        cp.name             AS productName,
+        u.name              AS userName,
+        u.phone             AS userPhone
+      FROM user_cycle_purchases ucp
+      LEFT JOIN cycle_products cp ON cp.id = ucp.cycle_product_id
+      LEFT JOIN users u ON u.id = ucp.user_id
+      ${whereClause}
+      ORDER BY ucp.id DESC
+      LIMIT 2000
+      `,
+      params
+    )
+
+    const orders = rows.map((row) => {
+      const endsAt = row.endsAt ? new Date(row.endsAt) : null
+      const dbStatus = String(row.status ?? 'active')
+      let uiStatus: 'ongoing' | 'completed' | 'expired' = 'ongoing'
+      if (dbStatus === 'completed') {
+        uiStatus = 'completed'
+      } else if (endsAt && endsAt.getTime() < now.getTime()) {
+        uiStatus = 'expired'
+      }
+
+      return {
+        id: Number(row.id),
+        userId: Number(row.userId),
+        userName: String(row.userName ?? ''),
+        userPhone: String(row.userPhone ?? ''),
+        productName: String(row.productName ?? 'Plano de ciclo'),
+        amountPaid: Number(row.amountPaid ?? 0),
+        expectedProfit: Number(row.expectedProfit ?? 0),
+        cycleDays: Number(row.cycleDays ?? 0),
+        status: dbStatus,
+        uiStatus,
+        startedAt: row.startedAt ?? null,
+        endsAt: row.endsAt ?? null,
+      }
+    })
+
+    res.json({ ok: true, orders, total: orders.length })
+  } catch (err) {
+    console.error('[admin-cycles-all]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao carregar ciclos.' })
+  }
+})
+
 app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
   try {
     await ensureCycleProductsTable()
