@@ -4580,6 +4580,148 @@ app.get('/api/cycle-products/my-purchases/:userId', requireAuth, async (req: Aut
   }
 })
 
+// POST /api/admin/cycles/retroactive-capital-fix
+// Corrige retroativamente ciclos já concluídos que não devolveram o capital investido.
+// Usa coluna capital_returned para evitar duplo crédito.
+// query param ?dryRun=true para prévia sem alterar dados.
+app.post('/api/admin/cycles/retroactive-capital-fix', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const dryRun = String((req.query as Record<string, string>).dryRun ?? '').toLowerCase() === 'true'
+
+  const conn = await pool.getConnection()
+  try {
+    // Garantir coluna capital_returned na tabela
+    await conn.query(
+      `ALTER TABLE user_cycle_purchases ADD COLUMN IF NOT EXISTS capital_returned TINYINT(1) NOT NULL DEFAULT 0`
+    ).catch(() => null)
+
+    // Buscar todos os ciclos concluídos onde o capital ainda não foi devolvido
+    const [pendingRows] = await conn.query<RowDataPacket[]>(
+      `
+      SELECT
+        ucp.id,
+        ucp.user_id AS userId,
+        ucp.amount_paid AS amountPaid,
+        u.name AS userName,
+        u.phone AS userPhone
+      FROM user_cycle_purchases ucp
+      JOIN users u ON u.id = ucp.user_id
+      WHERE ucp.status = 'completed'
+        AND ucp.capital_returned = 0
+        AND ucp.amount_paid > 0
+      ORDER BY ucp.user_id ASC, ucp.id ASC
+      `
+    )
+
+    if (pendingRows.length === 0) {
+      res.json({ ok: true, message: 'Nenhum ciclo pendente de correção.', fixed: 0, totalCredited: 0, dryRun, users: [] })
+      return
+    }
+
+    // Agrupar por usuário
+    const byUser = new Map<number, { userId: number; userName: string; userPhone: string; purchaseIds: number[]; totalCapital: number }>()
+    for (const row of pendingRows) {
+      const uid = Number(row.userId)
+      if (!byUser.has(uid)) {
+        byUser.set(uid, {
+          userId: uid,
+          userName: String(row.userName ?? ''),
+          userPhone: String(row.userPhone ?? ''),
+          purchaseIds: [],
+          totalCapital: 0,
+        })
+      }
+      const entry = byUser.get(uid)!
+      entry.purchaseIds.push(Number(row.id))
+      entry.totalCapital = Number((entry.totalCapital + Number(row.amountPaid ?? 0)).toFixed(2))
+    }
+
+    const usersSummary = Array.from(byUser.values()).map((e) => ({
+      userId: e.userId,
+      userName: e.userName,
+      userPhone: e.userPhone,
+      purchasesCount: e.purchaseIds.length,
+      totalCapital: e.totalCapital,
+    }))
+
+    const totalCredited = usersSummary.reduce((s, u) => s + u.totalCapital, 0)
+
+    if (dryRun) {
+      res.json({
+        ok: true,
+        dryRun: true,
+        message: `Prévia: ${usersSummary.length} usuários seriam corrigidos, total R$ ${totalCredited.toFixed(2)}.`,
+        fixed: usersSummary.length,
+        totalCredited: Number(totalCredited.toFixed(2)),
+        users: usersSummary,
+      })
+      return
+    }
+
+    // Aplicar correções
+    await conn.beginTransaction()
+
+    let correctedUsers = 0
+    let correctedPurchases = 0
+
+    for (const [uid, entry] of byUser) {
+      const credit = Number(entry.totalCapital.toFixed(2))
+      if (credit <= 0) continue
+
+      // Creditar capital no saldo do usuário
+      await conn.query(
+        'UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id = ?',
+        [credit, uid]
+      )
+
+      // Marcar purchases como capital_returned = 1
+      await conn.query(
+        `UPDATE user_cycle_purchases SET capital_returned = 1 WHERE id IN (${entry.purchaseIds.map(() => '?').join(',')})`,
+        entry.purchaseIds
+      )
+
+      // Log da correção
+      await conn.query(
+        `
+        INSERT INTO logs (user_id, entity_type, entity_id, action, amount, metadata, created_at)
+        VALUES (?, 'cycle', ?, 'cycle_capital_retroactive_return', ?, ?, NOW())
+        `,
+        [
+          uid,
+          entry.purchaseIds[entry.purchaseIds.length - 1],
+          credit,
+          JSON.stringify({
+            purchaseIds: entry.purchaseIds,
+            totalCapitalReturned: credit,
+            purchasesCount: entry.purchaseIds.length,
+            retroactiveFix: true,
+          }),
+        ]
+      ).catch(() => null)
+
+      correctedUsers++
+      correctedPurchases += entry.purchaseIds.length
+    }
+
+    await conn.commit()
+
+    res.json({
+      ok: true,
+      dryRun: false,
+      message: `Correção aplicada: ${correctedUsers} usuários, ${correctedPurchases} ciclos, total R$ ${totalCredited.toFixed(2)} devolvidos.`,
+      fixed: correctedUsers,
+      correctedPurchases,
+      totalCredited: Number(totalCredited.toFixed(2)),
+      users: usersSummary,
+    })
+  } catch (err) {
+    await conn.rollback()
+    console.error('[cycles-retroactive-capital-fix]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao executar correção retroativa.' })
+  } finally {
+    conn.release()
+  }
+})
+
 app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
   try {
     await ensureCycleProductsTable()
