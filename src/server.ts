@@ -15631,6 +15631,49 @@ app.patch('/api/admin/users/referral-link-bulk', requireMaxAdmin, async (req, re
   }
 })
 
+// POST /api/admin/users/:id/login-as — gera token de impersonação para entrar como usuário
+app.post('/api/admin/users/:id/login-as', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.params.id)
+
+  if (!userId || Number.isNaN(userId)) {
+    res.status(400).json({ ok: false, error: 'ID de usuário inválido.' })
+    return
+  }
+
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, name, phone FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    )
+
+    if (rows.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    const targetUser = rows[0]
+
+    const impersonationToken = jwt.sign(
+      { id: targetUser.id, phone: targetUser.phone },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    )
+
+    res.json({
+      ok: true,
+      token: impersonationToken,
+      user: {
+        id: Number(targetUser.id),
+        name: String(targetUser.name ?? ''),
+        phone: String(targetUser.phone ?? ''),
+      },
+    })
+  } catch (err) {
+    console.error('[admin-login-as]', err)
+    res.status(500).json({ ok: false, error: 'Falha ao gerar token de acesso.' })
+  }
+})
+
 app.delete('/api/admin/users/:id/telegram', requireMaxAdmin, async (req, res) => {
   const userId = Number(req.params.id)
 
