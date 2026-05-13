@@ -10048,17 +10048,19 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
         [safeAmount, parsedUserId]
       )
     } else {
-      // Desconte da balance, usando commission_balance como auxílio (lógica original)
+      // Desconta da balance. recharge_balance precisa vir ANTES de commission_balance no SET
+      // para usar o valor ORIGINAL de commission_balance no cálculo do restante
+      // (MySQL avalia SET da esquerda para direita; inverter a ordem causaria dupla dedução)
       await conn.query(
         `
         UPDATE users
         SET
           balance = ?,
-          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0),
           recharge_balance = GREATEST(
             COALESCE(recharge_balance, 0) - GREATEST(? - COALESCE(commission_balance, 0), 0),
             0
-          )
+          ),
+          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0)
         WHERE id = ?
         `,
         [newBalance, safeAmount, safeAmount, parsedUserId]
@@ -11196,10 +11198,11 @@ const applyReferralCommissionsForTask = async (
               `
               UPDATE users
               SET
+                balance = COALESCE(balance, 0) + ?,
                 commission_balance = COALESCE(commission_balance, 0) + ?
               WHERE id = ?
               `,
-              [commissionAmount, parentUserId]
+              [commissionAmount, commissionAmount, parentUserId]
             )
 
             await conn.query(
@@ -11468,10 +11471,11 @@ const applyReferralCommissionsForDeposit = async (cashinPaymentId: number, depos
               `
               UPDATE users
               SET
+                balance = COALESCE(balance, 0) + ?,
                 commission_balance = COALESCE(commission_balance, 0) + ?
               WHERE id = ?
               `,
-              [commissionAmount, parentUserId]
+              [commissionAmount, commissionAmount, parentUserId]
             )
 
             await conn.query(
@@ -11626,15 +11630,16 @@ const applyReferralCommissionsForVipPurchase = async (
       if (levelConfig) {
         const commissionAmount = Number((vipLevelPrice * (levelConfig.commissionPercent / 100)).toFixed(2))
         if (commissionAmount > 0) {
-          // Credita comissão APENAS no commission_balance do upline
+          // Credita comissão no balance total E no commission_balance do upline
           await conn.query(
             `
             UPDATE users
             SET
+              balance = COALESCE(balance, 0) + ?,
               commission_balance = COALESCE(commission_balance, 0) + ?
             WHERE id = ?
             `,
-            [commissionAmount, parentUserId]
+            [commissionAmount, commissionAmount, parentUserId]
           )
 
           beneficiaryIds.push(parentUserId)
@@ -16412,10 +16417,10 @@ app.post('/api/admin/commission-reversal', requireMaxAdmin, async (req, res) => 
       const beneficiaryUserId = Number(payout.beneficiaryUserId)
       const commissionAmount = Number(payout.commissionAmount)
 
-      // Restaura commission_balance do upline que recebeu indevidamente
+      // Restaura balance E commission_balance do upline que recebeu indevidamente
       await conn.query(
-        `UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`,
-        [commissionAmount, beneficiaryUserId]
+        `UPDATE users SET balance = GREATEST(COALESCE(balance, 0) - ?, 0), commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0) WHERE id = ?`,
+        [commissionAmount, commissionAmount, beneficiaryUserId]
       )
 
       // Log de estorno
@@ -16451,8 +16456,8 @@ app.post('/api/admin/commission-reversal', requireMaxAdmin, async (req, res) => 
       const commissionAmount = Number(payout.commissionAmount)
 
       await conn.query(
-        `UPDATE users SET commission_balance = COALESCE(commission_balance, 0) - ? WHERE id = ?`,
-        [commissionAmount, beneficiaryUserId]
+        `UPDATE users SET balance = GREATEST(COALESCE(balance, 0) - ?, 0), commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0) WHERE id = ?`,
+        [commissionAmount, commissionAmount, beneficiaryUserId]
       )
 
       await conn.query(
