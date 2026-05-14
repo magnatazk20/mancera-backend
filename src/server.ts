@@ -17428,6 +17428,7 @@ app.get('/api/admin/users/:id/details', requireAdminLevelTwo, async (req, res) =
         phone: String(user.phone ?? ''),
         is_admin: Number(user.is_admin ?? 0),
         is_banned: Number(user.is_banned ?? 0),
+        allow_referral_link: Number(user.allow_referral_link ?? 1),
         created_at: user.created_at,
         balance: Number(user.balance ?? 0),
         shopBalance: Number(user.shopBalance ?? 0),
