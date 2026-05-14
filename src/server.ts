@@ -9881,10 +9881,10 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
     const holderCpf = String(pixRows[0].holderCpf ?? '').replace(/\D/g, '')
     const pixKeyType = normalizePixType(String(pixRows[0].pixKeyType ?? 'CHAVE_ALEATORIA'))
     const pixKey = normalizePixKey(String(pixRows[0].pixKey ?? ''), pixKeyType)
-    // Usa o saldo da carteira correta: commission ou recharge (saldo normal)
+    // Usa o saldo da carteira correta: commission_balance ou balance
     const currentBalance = isCommissionWallet
       ? Number(users[0].commissionBalance ?? 0)
-      : Number(users[0].rechargeBalance ?? 0)
+      : Number(users[0].balance ?? 0)
 
     if (!holderName || holderCpf.length !== 11 || !pixKey) {
       await conn.rollback()
@@ -10042,29 +10042,16 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
 
     // ── Desconta da carteira correta ──
     if (isCommissionWallet) {
-      // Saque de comissão: desconta de balance e commission_balance
+      // Saque de comissão: desconta só de commission_balance (carteira independente)
       await conn.query(
-        `
-        UPDATE users
-        SET
-          balance = GREATEST(COALESCE(balance, 0) - ?, 0),
-          commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0)
-        WHERE id = ?
-        `,
-        [safeAmount, safeAmount, parsedUserId]
+        `UPDATE users SET commission_balance = GREATEST(COALESCE(commission_balance, 0) - ?, 0) WHERE id = ?`,
+        [safeAmount, parsedUserId]
       )
     } else {
-      // Saque do saldo normal: desconta apenas de balance e recharge_balance.
-      // commission_balance NÃO é tocada — pertenece à carteira de comissão separada.
+      // Saque de saldo normal: desconta só de balance (commission_balance intocada)
       await conn.query(
-        `
-        UPDATE users
-        SET
-          balance = GREATEST(COALESCE(balance, 0) - ?, 0),
-          recharge_balance = GREATEST(COALESCE(recharge_balance, 0) - ?, 0)
-        WHERE id = ?
-        `,
-        [safeAmount, safeAmount, parsedUserId]
+        `UPDATE users SET balance = GREATEST(COALESCE(balance, 0) - ?, 0) WHERE id = ?`,
+        [safeAmount, parsedUserId]
       )
     }
 
