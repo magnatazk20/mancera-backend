@@ -6538,20 +6538,22 @@ app.get('/api/admin/vip-users', requireMaxAdmin, async (req, res) => {
   }
 })
 
-// Lista de usuários VIP T1+ que convidaram alguém desde que se tornaram VIP T1+
+// Lista de indicações feitas por VIPs T1+ desde que se tornaram VIP T1+
+// Uma linha por convidado, com data de cadastro e se depositou
 app.get('/api/admin/vip-referrals', requireMaxAdmin, async (req, res) => {
   try {
     const search = String(req.query.search ?? '').trim()
     const page = Math.max(1, Number(req.query.page ?? 1))
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)))
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100)))
     const offset = (page - 1) * limit
 
+    // busca no nome/telefone do VIP que indicou
     const searchWhere = search ? 'AND (u.name LIKE ? OR u.phone LIKE ?)' : ''
     const searchParams = search ? [`%${search}%`, `%${search}%`] : []
 
     const [countRows] = await pool.query<RowDataPacket[]>(
       `
-      SELECT COUNT(DISTINCT u.id) AS total
+      SELECT COUNT(*) AS total
       FROM user_vips uv
       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
       INNER JOIN users u ON u.id = uv.user_id
@@ -6561,16 +6563,12 @@ app.get('/api/admin/vip-referrals', requireMaxAdmin, async (req, res) => {
         WHERE vip_level_id != 6
         GROUP BY user_id
       ) AS earliest ON earliest.user_id = u.id
+      INNER JOIN users r ON r.referred_by_user_id = u.id AND r.created_at >= earliest.firstT1At
       WHERE uv.status = 'active'
         AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
         AND vl.id != 6
         AND vl.price > 0
         ${searchWhere}
-        AND EXISTS (
-          SELECT 1 FROM users r
-          WHERE r.referred_by_user_id = u.id
-            AND r.created_at >= earliest.firstT1At
-        )
       `,
       searchParams
     )
@@ -6579,20 +6577,18 @@ app.get('/api/admin/vip-referrals', requireMaxAdmin, async (req, res) => {
     const [rows] = await pool.query<RowDataPacket[]>(
       `
       SELECT
-        u.id AS userId,
-        u.name,
-        u.phone,
+        u.id    AS vipUserId,
+        u.name  AS vipUserName,
+        u.phone AS vipUserPhone,
         vl.name AS vipName,
-        vl.id AS vipLevelId,
-        vl.price AS vipPrice,
-        uv.started_at AS vipStartedAt,
-        uv.expires_at AS vipExpiresAt,
+        vl.id   AS vipLevelId,
         earliest.firstT1At,
-        (
-          SELECT COUNT(*) FROM users r
-          WHERE r.referred_by_user_id = u.id
-            AND r.created_at >= earliest.firstT1At
-        ) AS invitedSinceVip
+        uv.expires_at AS vipExpiresAt,
+        r.id    AS invitedUserId,
+        r.name  AS invitedName,
+        r.phone AS invitedPhone,
+        r.created_at AS invitedAt,
+        CASE WHEN COALESCE(r.total_deposits, 0) > 0 THEN 1 ELSE 0 END AS hasDeposit
       FROM user_vips uv
       INNER JOIN vip_levels vl ON vl.id = uv.vip_level_id
       INNER JOIN users u ON u.id = uv.user_id
@@ -6602,36 +6598,34 @@ app.get('/api/admin/vip-referrals', requireMaxAdmin, async (req, res) => {
         WHERE vip_level_id != 6
         GROUP BY user_id
       ) AS earliest ON earliest.user_id = u.id
+      INNER JOIN users r ON r.referred_by_user_id = u.id AND r.created_at >= earliest.firstT1At
       WHERE uv.status = 'active'
         AND (uv.expires_at IS NULL OR uv.expires_at > NOW())
         AND vl.id != 6
         AND vl.price > 0
         ${searchWhere}
-        AND (
-          SELECT COUNT(*) FROM users r
-          WHERE r.referred_by_user_id = u.id
-            AND r.created_at >= earliest.firstT1At
-        ) > 0
-      ORDER BY invitedSinceVip DESC
+      ORDER BY r.created_at DESC
       LIMIT ? OFFSET ?
       `,
       [...searchParams, limit, offset]
     )
 
-    const users = rows.map((row) => ({
-      userId: Number(row.userId),
-      name: String(row.name ?? ''),
-      phone: String(row.phone ?? ''),
+    const referrals = rows.map((row) => ({
+      vipUserId: Number(row.vipUserId),
+      vipUserName: String(row.vipUserName ?? ''),
+      vipUserPhone: String(row.vipUserPhone ?? ''),
       vipName: String(row.vipName ?? ''),
       vipLevelId: Number(row.vipLevelId ?? 0),
-      vipPrice: Number(row.vipPrice ?? 0),
-      vipStartedAt: row.vipStartedAt ? String(row.vipStartedAt) : null,
-      vipExpiresAt: row.vipExpiresAt ? String(row.vipExpiresAt) : null,
       firstT1At: row.firstT1At ? String(row.firstT1At) : null,
-      invitedSinceVip: Number(row.invitedSinceVip ?? 0),
+      vipExpiresAt: row.vipExpiresAt ? String(row.vipExpiresAt) : null,
+      invitedUserId: Number(row.invitedUserId),
+      invitedName: String(row.invitedName ?? ''),
+      invitedPhone: String(row.invitedPhone ?? ''),
+      invitedAt: row.invitedAt ? String(row.invitedAt) : null,
+      hasDeposit: Number(row.hasDeposit ?? 0) === 1,
     }))
 
-    res.json({ ok: true, total, page, limit, users })
+    res.json({ ok: true, total, page, limit, referrals })
   } catch (err) {
     console.error('[admin-vip-referrals]', err)
     const message = err instanceof Error ? err.message : String(err)
