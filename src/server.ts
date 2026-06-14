@@ -12,6 +12,30 @@ import pool, { DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER } from './db'
 import type { NextFunction, Request, Response } from 'express'
 import type { RowDataPacket, ResultSetHeader } from 'mysql2'
 import mysql from 'mysql2/promise'
+import geoip from 'geoip-lite'
+
+function getRealIp(req: Request): string {
+  const cf = req.headers['cf-connecting-ip']
+  if (cf) return (Array.isArray(cf) ? cf[0] : cf).trim()
+  const xReal = req.headers['x-real-ip']
+  if (xReal) return (Array.isArray(xReal) ? xReal[0] : xReal).trim()
+  const xff = req.headers['x-forwarded-for']
+  if (xff) {
+    const first = (Array.isArray(xff) ? xff[0] : xff).split(',')[0]?.trim()
+    if (first) return first
+  }
+  return req.socket?.remoteAddress ?? req.ip ?? 'unknown'
+}
+
+function getIpLocation(ip: string): string {
+  try {
+    const clean = ip.replace(/^::ffff:/, '')
+    const geo = geoip.lookup(clean)
+    if (!geo) return ''
+    const parts = [geo.city, geo.region, geo.country].filter(Boolean)
+    return parts.join(', ')
+  } catch { return '' }
+}
 
 // Bloqueia requisições simultâneas de completação (mesmo user + task)
 // Mapa: key = `${userId}:${taskId}`, value = true
@@ -1610,21 +1634,21 @@ const settleExpiredCyclesForUser = async (userId: number) => {
       if (capital > 0) totalCapitalReturn += capital
     }
 
-    // Total a creditar = lucro + capital investido (retorna tudo ao final do ciclo)
-    const totalCredit = Number((totalProfit + totalCapitalReturn).toFixed(2))
+    // Total a creditar = apenas capital investido (lucro já foi creditado diariamente pelo job)
+    const totalCredit = Number(totalCapitalReturn.toFixed(2))
 
     const oldBalance = Number(userRows[0].balance ?? 0)
 
+    // Credita APENAS na carteira normal (balance), não duplica na commission_balance
     if (totalCredit > 0) {
       await conn.query(
         `
         UPDATE users
         SET
-          balance = COALESCE(balance, 0) + ?,
-          commission_balance = COALESCE(commission_balance, 0) + ?
+          balance = COALESCE(balance, 0) + ?
         WHERE id = ?
         `,
-        [totalCredit, totalCredit, userId]
+        [totalCredit, userId]
       )
     }
 
@@ -1862,6 +1886,100 @@ setInterval(async () => {
     )
   } catch (err) {
     console.error('[vip-expire-job]', err)
+  }
+}, 60_000)
+
+// ─── Job: Crédito diário de renda de ciclos ─────────────────────────────────
+// Credita a renda diária de cada ciclo ativo a cada 60 segundos (verifica se já passou 24h do último crédito ou do início)
+setInterval(async () => {
+  try {
+    // Busca ciclos ativos que podem receber crédito diário
+    // Condições: status='active', ends_at > NOW(), e passou 24h desde last_credited_at ou desde started_at
+    const [cycles] = await pool.query<RowDataPacket[]>(`
+      SELECT
+        ucp.id,
+        ucp.user_id,
+        ucp.amount_paid AS amountPaid,
+        ucp.expected_profit AS expectedProfit,
+        ucp.cycle_days AS cycleDays,
+        COALESCE(ucp.total_credited, 0) AS totalCredited,
+        ucp.last_credited_at AS lastCreditedAt,
+        ucp.started_at AS startedAt,
+        ucp.ends_at AS endsAt,
+        TIMESTAMPDIFF(SECOND, COALESCE(ucp.last_credited_at, ucp.started_at), NOW()) AS secondsSinceLastCredit
+      FROM user_cycle_purchases ucp
+      WHERE ucp.status = 'active'
+        AND ucp.ends_at IS NOT NULL
+        AND ucp.ends_at > NOW()
+        AND TIMESTAMPDIFF(SECOND, COALESCE(ucp.last_credited_at, ucp.started_at), NOW()) >= 86400
+      FOR UPDATE
+    `)
+
+    for (const cycle of cycles) {
+      const conn = await pool.getConnection()
+      try {
+        await conn.beginTransaction()
+
+        const cycleId = Number(cycle.id)
+        const userId = Number(cycle.user_id)
+        const amountPaid = Number(cycle.amountPaid)
+        const expectedProfit = Number(cycle.expectedProfit)
+        const cycleDays = Number(cycle.cycleDays)
+        const totalCredited = Number(cycle.totalCredited)
+        const lastCreditedAt = cycle.lastCreditedAt
+
+        // Calcula a renda diária: (expected_profit / cycle_days)
+        // Ou se preferir: amount_paid * daily_percent
+        const dailyIncome = Number((expectedProfit / cycleDays).toFixed(2))
+
+        // Verifica se ainda há saldo a ser creditado (evita超额)
+        const remainingProfit = Number((expectedProfit - totalCredited).toFixed(2))
+
+        if (dailyIncome <= 0 || remainingProfit <= 0) {
+          await conn.rollback()
+          continue
+        }
+
+        // Atualiza last_credited_at ANTES de creditar para evitar concorrência
+        await conn.query(
+          `UPDATE user_cycle_purchases SET last_credited_at = NOW() WHERE id = ?`,
+          [cycleId]
+        )
+
+        // Credita a renda diária APENAS na carteira normal (balance)
+        await conn.query(
+          `UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE id = ?`,
+          [dailyIncome, userId]
+        )
+
+        // Atualiza total_credited na tabela do ciclo
+        await conn.query(
+          `UPDATE user_cycle_purchases SET total_credited = COALESCE(total_credited, 0) + ? WHERE id = ?`,
+          [dailyIncome, cycleId]
+        )
+
+        // Log do crédito
+        const newTotalCredited = totalCredited + dailyIncome
+        await conn.query(
+          `INSERT INTO logs (user_id, entity_type, entity_id, action, old_balance, new_balance, amount, metadata)
+           SELECT ?, 'cycle', ?, 'cycle_daily_income',
+                  COALESCE(balance, 0) - ?, balance, ?,
+                  JSON_OBJECT('cycleId', ?, 'dailyIncome', ?, 'totalCredited', ?, 'remainingProfit', ?)
+           FROM users WHERE id = ?`,
+          [userId, cycleId, dailyIncome, dailyIncome, cycleId, dailyIncome, newTotalCredited, remainingProfit, userId]
+        )
+
+        await conn.commit()
+        console.log(`[cycle-daily-income] user=${userId} cycle=${cycleId} credited=R$${dailyIncome}`)
+      } catch (err) {
+        await conn.rollback()
+        console.error('[cycle-daily-income]', err)
+      } finally {
+        conn.release()
+      }
+    }
+  } catch (err) {
+    console.error('[cycle-daily-income-job]', err)
   }
 }, 60_000)
 
@@ -2715,9 +2833,15 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     // Inserir usuário com referral próprio e badge inicial "Estagiário"
     await pool.query("ALTER TABLE users ADD COLUMN badge VARCHAR(50) NOT NULL DEFAULT 'Estagiário'").catch(() => null)
     await pool.query("ALTER TABLE users ADD COLUMN allow_referral_link TINYINT(1) NOT NULL DEFAULT 1").catch(() => null)
+    await pool.query("ALTER TABLE users ADD COLUMN ip_address VARCHAR(64) NULL DEFAULT NULL").catch(() => null)
+    await pool.query("ALTER TABLE users ADD COLUMN ip_location VARCHAR(128) NULL DEFAULT NULL").catch(() => null)
+
+    const registrationIp = getRealIp(req)
+    const registrationLocation = getIpLocation(registrationIp)
+
     const [result] = await pool.query(
-      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id, badge, allow_referral_link) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [name, normalizedPhone, hash, userReferralCode, referredByUserId, 'Estagiário', siteAllowReferral]
+      'INSERT INTO users (name, phone, password, referral_code, referred_by_user_id, badge, allow_referral_link, ip_address, ip_location) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, normalizedPhone, hash, userReferralCode, referredByUserId, 'Estagiário', siteAllowReferral, registrationIp, registrationLocation || null]
     ) as any
 
     const userId = result.insertId
@@ -2792,6 +2916,147 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   } catch (err) {
     console.error('[register]', err)
     res.status(500).json({ error: 'Erro interno no servidor.' })
+  }
+})
+
+// GET /api/user/task-bonus/:userId — retorna status dos bônus de tarefa do usuário
+app.get('/api/user/task-bonus/:userId', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId)
+  if (!userId || userId <= 0) {
+    res.status(400).json({ ok: false, error: 'ID inválido.' })
+    return
+  }
+
+  try {
+    // Garante tabela de resgatados
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS task_bonus_redemptions (
+        id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id    BIGINT UNSIGNED NOT NULL,
+        tier_index INT UNSIGNED    NOT NULL COMMENT 'Índice do tier (0=5convites, 1=10, 2=20, 3=35, 4=50)',
+        redeemed_at DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_task_bonus_user_tier (user_id, tier_index),
+        KEY idx_task_bonus_user (user_id)
+      )
+    `).catch(() => null)
+
+    // Busca resgatados
+    const [redeemedRows] = await pool.query<RowDataPacket[]>(
+      'SELECT tier_index FROM task_bonus_redemptions WHERE user_id = ?',
+      [userId]
+    )
+    const redeemedSet = new Set(redeemedRows.map((r) => Number(r.tier_index)))
+
+    // Conta indicados nível 1 que fizeram depósito pago (status paid na tabela cashin_payments)
+    const [lvl1Rows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(DISTINCT u.id) AS total
+       FROM users u
+       INNER JOIN cashin_payments cp ON cp.user_id = u.id AND cp.status IN ('paid', 'payment.paid')
+       WHERE u.referred_by_user_id = ?`,
+      [userId]
+    )
+    const validInvites = Number(lvl1Rows[0]?.total ?? 0)
+
+    res.json({ ok: true, validInvites, redeemedTiers: [...redeemedSet] })
+  } catch (err) {
+    console.error('[task-bonus-get]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao buscar bônus de tarefa.' })
+  }
+})
+
+// POST /api/user/task-bonus/:tierIndex/redeem — resgata bônus de tarefa
+app.post('/api/user/task-bonus/:tierIndex/redeem', requireAuth, async (req, res) => {
+  const tierIndex = Number(req.params.tierIndex)
+  const userId = Number((req as any).authUser?.id ?? 0)
+
+  if (isNaN(tierIndex) || tierIndex < 0 || tierIndex > 4 || !userId) {
+    res.status(400).json({ ok: false, error: 'Índice inválido.' })
+    return
+  }
+
+  const BONUS_TIERS = [
+    { invites: 5,  reward: 10 },
+    { invites: 10, reward: 25 },
+    { invites: 20, reward: 60 },
+    { invites: 35, reward: 120 },
+    { invites: 50, reward: 200 },
+  ]
+
+  const tier = BONUS_TIERS[tierIndex]
+  if (!tier) {
+    res.status(400).json({ ok: false, error: 'Tier inválido.' })
+    return
+  }
+
+  try {
+    // Garante tabela
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS task_bonus_redemptions (
+        id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id    BIGINT UNSIGNED NOT NULL,
+        tier_index INT UNSIGNED    NOT NULL,
+        redeemed_at DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_task_bonus_user_tier (user_id, tier_index),
+        KEY idx_task_bonus_user (user_id)
+      )
+    `).catch(() => null)
+
+    // Verifica se já resgatou
+    const [existingRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM task_bonus_redemptions WHERE user_id = ? AND tier_index = ?',
+      [userId, tierIndex]
+    )
+    if (existingRows.length > 0) {
+      res.status(400).json({ ok: false, error: 'Você já resgatou este bônus.' })
+      return
+    }
+
+    // Verifica se tem convites suficientes (apenas nível 1 com depósito pago confirmado)
+    const [lvl1Rows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(DISTINCT u.id) AS total
+       FROM users u
+       INNER JOIN cashin_payments cp ON cp.user_id = u.id AND cp.status IN ('paid', 'payment.paid')
+       WHERE u.referred_by_user_id = ?`,
+      [userId]
+    )
+    const validInvites = Number(lvl1Rows[0]?.total ?? 0)
+    if (validInvites < tier.invites) {
+      res.status(400).json({
+        ok: false,
+        error: `Você precisa de ${tier.invites} convites válidos. Você tem ${validInvites}.`
+      })
+      return
+    }
+
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+      await conn.query(
+        'INSERT INTO task_bonus_redemptions (user_id, tier_index) VALUES (?, ?)',
+        [userId, tierIndex]
+      )
+      await conn.query(
+        'UPDATE users SET balance = balance + ?, commission_balance = COALESCE(commission_balance, 0) + ? WHERE id = ?',
+        [tier.reward, tier.reward, userId]
+      )
+      await conn.commit()
+    } catch (txErr) {
+      await conn.rollback()
+      throw txErr
+    } finally {
+      conn.release()
+    }
+
+    res.json({
+      ok: true,
+      message: `Parabéns! Você resgatou R$ ${tier.reward.toFixed(2)} pelo bônus de ${tier.invites} convites.`,
+      rewardAmount: tier.reward,
+    })
+  } catch (err) {
+    console.error('[task-bonus-redeem]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao resgatar bônus.' })
   }
 })
 
@@ -2877,6 +3142,9 @@ app.get('/api/user/summary/:id', async (req, res) => {
     await pool
       .query('ALTER TABLE users ADD COLUMN commission_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00')
       .catch(() => null)
+    await pool
+      .query('ALTER TABLE users ADD COLUMN mancecoin_balance DECIMAL(12,2) NOT NULL DEFAULT 0.00')
+      .catch(() => null)
 
     // Auto-expirar VIPs vencidos antes de consultar
     await pool.query(
@@ -2894,7 +3162,8 @@ app.get('/api/user/summary/:id', async (req, res) => {
          monthly_salary_contract AS monthlySalaryContract,
          badge,
          recharge_balance   AS rechargeBalance,
-         commission_balance AS commissionBalance
+         commission_balance AS commissionBalance,
+         COALESCE(mancecoin_balance, 0) AS mancecoinBalance
        FROM users WHERE id = ?`,
       [userId]
     )
@@ -2967,6 +3236,7 @@ app.get('/api/user/summary/:id', async (req, res) => {
       badge?: string | null
       rechargeBalance?: number | string
       commissionBalance?: number | string
+      mancecoinBalance?: number | string
     }
 
     console.log('[user-summary] final response currentVip:', JSON.stringify(currentVip))
@@ -2976,6 +3246,7 @@ app.get('/api/user/summary/:id', async (req, res) => {
       totalDeposits: Number(row.total_deposits ?? 0),
       rechargeBalance: Number(row.rechargeBalance ?? 0),
       commissionBalance: Number(row.commissionBalance ?? 0),
+      mancecoinBalance: Number(row.mancecoinBalance ?? 0),
       monthlySalaryContract: row.monthlySalaryContract == null ? null : String(row.monthlySalaryContract),
       badge: row.badge == null || String(row.badge).trim() === '' ? 'Estagiário' : String(row.badge),
       currentVip,
@@ -4512,6 +4783,7 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         description,
         amount,
         profit,
+        COALESCE(mancecoin_reward, 0) AS mancecoinReward,
         cycle_days AS cycleDays,
         image_url AS imageUrl,
         is_active AS isActive,
@@ -4545,6 +4817,7 @@ app.get('/api/dashboard/cycle-products', async (_req, res) => {
         description: String(row.description ?? ''),
         amount: Number(row.amount ?? 0),
         profit: Number(row.profit ?? 0),
+        mancecoinReward: Number(row.mancecoinReward ?? 0),
         cycleDays: Number(row.cycleDays ?? 0),
         imageUrl: String(row.imageUrl ?? ''),
         isActive: Number(row.isActive ?? 1) === 1,
@@ -4841,6 +5114,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
         description,
         amount,
         profit,
+        COALESCE(mancecoin_reward, 0) AS mancecoinReward,
         cycle_days AS cycleDays,
         image_url AS imageUrl,
         is_active AS isActive,
@@ -4868,6 +5142,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
       imageUrl: String(row.imageUrl ?? ''),
       price: Number(row.amount ?? 0),
       redeemRewardValue: Number(row.profit ?? 0),
+      mancecoinReward: Number(row.mancecoinReward ?? 0),
       cycleDays: Number(row.cycleDays ?? 0),
       isActive: Number(row.isActive ?? 1) === 1,
       sortOrder: Number(row.sortOrder ?? 0),
@@ -4893,7 +5168,7 @@ app.get('/api/admin/cycle-products', requireMaxAdmin, async (_req, res) => {
 
 app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const {
-    name, description, imageUrl, price, redeemRewardValue, isActive,
+    name, description, imageUrl, price, redeemRewardValue, mancecoinReward, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
     maxPurchasesPerUser, minAmount, maxAmount, profitPercent,
@@ -4903,6 +5178,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     imageUrl?: string
     price?: number | string
     redeemRewardValue?: number | string
+    mancecoinReward?: number | string
     isActive?: boolean | number | string
     cycleDays?: number | string
     sortOrder?: number | string
@@ -4923,6 +5199,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
   const parsedImageUrl = String(imageUrl ?? '').trim()
   const parsedPrice = Number(String(price ?? '').replace(',', '.'))
   const parsedRedeemRewardValue = Number(String(redeemRewardValue ?? '').replace(',', '.'))
+  const parsedMancecoinReward = Number(String(mancecoinReward ?? '').replace(',', '.'))
   const parsedCycleDays = Number(String(cycleDays ?? 0))
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
@@ -4957,6 +5234,11 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
     return
   }
 
+  if (!Number.isFinite(parsedMancecoinReward) || parsedMancecoinReward < 0) {
+    res.status(400).json({ ok: false, error: 'Valor de MANCOIN inválido.' })
+    return
+  }
+
   if (!Number.isInteger(parsedCycleDays) || parsedCycleDays < 0) {
     res.status(400).json({ ok: false, error: 'Ciclo (dias) inválido.' })
     return
@@ -4973,6 +5255,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         description,
         amount,
         profit,
+        mancecoin_reward,
         cycle_days,
         stock_quantity,
         image_url,
@@ -4988,13 +5271,14 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
         max_amount,
         profit_percent
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         parsedName,
         parsedDescription || null,
         Number(parsedPrice.toFixed(2)),
         Number(parsedRedeemRewardValue.toFixed(2)),
+        Number(parsedMancecoinReward.toFixed(2)),
         parsedCycleDays,
         Number.isFinite(parsedStockQuantity) ? parsedStockQuantity : 0,
         parsedImageUrl || null,
@@ -5029,7 +5313,7 @@ app.post('/api/admin/cycle-products', requireMaxAdmin, async (req, res) => {
 app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const productId = Number(req.params.id)
   const {
-    name, description, imageUrl, price, redeemRewardValue, isActive,
+    name, description, imageUrl, price, redeemRewardValue, mancecoinReward, isActive,
     cycleDays, sortOrder, planType, stockQuantity, expiresAt,
     requireCommissionLevel1Count, requireCommissionLevel2Count, requireCommissionLevel3Count,
     maxPurchasesPerUser, minAmount, maxAmount, profitPercent,
@@ -5039,6 +5323,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     imageUrl?: string
     price?: number | string
     redeemRewardValue?: number | string
+    mancecoinReward?: number | string
     isActive?: boolean | number | string
     cycleDays?: number | string
     sortOrder?: number | string
@@ -5064,6 +5349,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
   const parsedImageUrl = String(imageUrl ?? '').trim()
   const parsedPrice = Number(String(price ?? '').replace(',', '.'))
   const parsedRedeemRewardValue = Number(String(redeemRewardValue ?? '').replace(',', '.'))
+  const parsedMancecoinReward = Number(String(mancecoinReward ?? '').replace(',', '.'))
   const parsedCycleDays = Number(String(cycleDays ?? 0))
   const parsedSortOrder = Number(String(sortOrder ?? 0))
   const parsedIsActive =
@@ -5098,6 +5384,11 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
     return
   }
 
+  if (!Number.isFinite(parsedMancecoinReward) || parsedMancecoinReward < 0) {
+    res.status(400).json({ ok: false, error: 'Valor de MANCOIN inválido.' })
+    return
+  }
+
   if (!Number.isInteger(parsedCycleDays) || parsedCycleDays < 0) {
     res.status(400).json({ ok: false, error: 'Ciclo (dias) inválido.' })
     return
@@ -5114,6 +5405,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         description = ?,
         amount = ?,
         profit = ?,
+        mancecoin_reward = ?,
         cycle_days = ?,
         stock_quantity = ?,
         image_url = ?,
@@ -5136,6 +5428,7 @@ app.put('/api/admin/cycle-products/:id', requireMaxAdmin, async (req, res) => {
         parsedDescription || null,
         Number(parsedPrice.toFixed(2)),
         Number(parsedRedeemRewardValue.toFixed(2)),
+        Number(parsedMancecoinReward.toFixed(2)),
         parsedCycleDays,
         Number.isFinite(parsedStockQuantity) ? parsedStockQuantity : 0,
         parsedImageUrl || null,
@@ -7204,6 +7497,8 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         ends_at DATETIME NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        last_credited_at DATETIME NULL,
         PRIMARY KEY (id),
         KEY idx_user_cycle_purchases_user_id (user_id),
         KEY idx_user_cycle_purchases_product_id (cycle_product_id),
@@ -7211,6 +7506,14 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
       )
       `
     )
+
+    // Migração: adicionar colunas total_credited e last_credited_at se não existirem
+    try {
+      await pool.query(`ALTER TABLE user_cycle_purchases ADD COLUMN total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
+    } catch { /* já existe */ }
+    try {
+      await pool.query(`ALTER TABLE user_cycle_purchases ADD COLUMN last_credited_at DATETIME NULL`)
+    } catch { /* já existe */ }
 
     const [cycleRows] = await pool.query<RowDataPacket[]>(
       `
@@ -7245,21 +7548,61 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         }
       : null
 
-    // Receita de hoje: soma de todos os créditos registrados nos logs do usuário no dia atual
-    // Considera apenas ações de crédito (amount > 0) excluindo compras (que debitam)
+    // Receita de hoje
     const [todayIncomeRows] = await pool.query<RowDataPacket[]>(
-      `
-      SELECT COALESCE(SUM(amount), 0) AS todayIncome
-      FROM logs
-      WHERE user_id = ?
-        AND amount > 0
-        AND action NOT IN ('cycle_investment_purchase', 'withdraw_request_created', 'withdraw_request_auto_processed')
-        AND DATE(created_at) = CURDATE()
-      `,
+      `SELECT COALESCE(SUM(amount), 0) AS todayIncome
+       FROM logs
+       WHERE user_id = ?
+         AND amount > 0
+         AND action NOT IN ('cycle_investment_purchase', 'withdraw_request_created', 'withdraw_request_auto_processed')
+         AND DATE(created_at) = CURDATE()`,
       [userId]
-    ).catch(() => [[{ todayIncome: 0 }], []] as unknown as [RowDataPacket[], unknown])
-
+    ).catch(() => [[{ todayIncome: 0 }]] as unknown as [RowDataPacket[]])
     const todayIncome = Number(todayIncomeRows[0]?.todayIncome ?? 0)
+
+    // Renda Total histórica (todos os créditos exceto compras e saques)
+    const [totalIncomeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(amount), 0) AS totalIncome
+       FROM logs
+       WHERE user_id = ?
+         AND amount > 0
+         AND action NOT IN ('cycle_investment_purchase', 'withdraw_request_created', 'withdraw_request_auto_processed')`,
+      [userId]
+    ).catch(() => [[{ totalIncome: 0 }]] as unknown as [RowDataPacket[]])
+    const totalIncome = Number(totalIncomeRows[0]?.totalIncome ?? 0)
+
+    // Retirada Total (saques aprovados/pagos)
+    const [withdrawRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM withdrawals
+       WHERE user_id = ?
+         AND LOWER(status) IN ('paid', 'payment.paid', 'approved', 'completed')`,
+      [userId]
+    ).catch(() => [[{ total: 0 }]] as unknown as [RowDataPacket[]])
+    const totalWithdrawals = Number(withdrawRows[0]?.total ?? 0)
+
+    // Renda do Produto (soma do que foi creditado pelos ciclos)
+    const [cycleIncomeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(total_credited), 0) AS cycleIncome
+       FROM user_cycle_purchases
+       WHERE user_id = ?`,
+      [userId]
+    ).catch(() => [[{ cycleIncome: 0 }]] as unknown as [RowDataPacket[]])
+    const cycleIncome = Number(cycleIncomeRows[0]?.cycleIncome ?? 0)
+
+    // Renda da Equipe (comissões recebidas como referenciador)
+    const [teamIncomeRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COALESCE(SUM(amount), 0) AS teamIncome
+       FROM logs
+       WHERE user_id = ?
+         AND amount > 0
+         AND action IN ('task_commission_credit', 'vip_commission_credit')`,
+      [userId]
+    ).catch(() => [[{ teamIncome: 0 }]] as unknown as [RowDataPacket[]])
+    const teamIncome = Number(teamIncomeRows[0]?.teamIncome ?? 0)
+
+    // Outras Rendas = total - produto - equipe
+    const otherIncome = Math.max(0, Number((totalIncome - cycleIncome - teamIncome).toFixed(2)))
 
     res.json({
       ok: true,
@@ -7269,6 +7612,11 @@ app.get('/api/profile/metrics/:userId', async (req, res) => {
         hasActiveCyclePlan,
         activeCyclePlan,
         todayIncome,
+        totalIncome,
+        totalWithdrawals,
+        cycleIncome,
+        teamIncome,
+        otherIncome,
       },
     })
   } catch (err) {
@@ -7340,7 +7688,8 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
              COALESCE(max_purchases_per_user, 0) AS maxPurchasesPerUser,
              COALESCE(min_amount, 0) AS minAmount,
              COALESCE(max_amount, 0) AS maxAmount,
-             COALESCE(profit_percent, 0) AS profitPercent
+             COALESCE(profit_percent, 0) AS profitPercent,
+             COALESCE(mancecoin_reward, 0) AS mancecoinReward
       FROM cycle_products
       WHERE id = ?
       LIMIT 1
@@ -7503,6 +7852,8 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
         status ENUM('active','completed','cancelled') NOT NULL DEFAULT 'active',
         started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         ends_at DATETIME NULL,
+        total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+        last_credited_at DATETIME NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
@@ -7512,6 +7863,13 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
       )
       `
     )
+
+    try {
+      await conn.query(`ALTER TABLE user_cycle_purchases ADD COLUMN total_credited DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
+    } catch { /* já existe */ }
+    try {
+      await conn.query(`ALTER TABLE user_cycle_purchases ADD COLUMN last_credited_at DATETIME NULL`)
+    } catch { /* já existe */ }
 
     await conn.query(
       `
@@ -7564,6 +7922,26 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
     ) as any
 
     const newBalance = Number((userBalance - amount).toFixed(2))
+
+    // Crédito de MANCOIN ao comprar plano de ciclo
+    const mancecoinReward = Number(product.mancecoinReward ?? 0)
+    if (mancecoinReward > 0) {
+      const [mancecoinBefore] = await conn.query<RowDataPacket[]>(
+        `SELECT COALESCE(mancecoin_balance, 0) AS balance FROM users WHERE id = ?`,
+        [parsedUserId]
+      )
+      const mancecoinOldBalance = Number(mancecoinBefore[0]?.balance ?? 0)
+      const mancecoinNewBalance = Number((mancecoinOldBalance + mancecoinReward).toFixed(2))
+      await conn.query(
+        `UPDATE users SET mancecoin_balance = ? WHERE id = ?`,
+        [mancecoinNewBalance, parsedUserId]
+      )
+      await conn.query(
+        `INSERT INTO logs (user_id, entity_type, entity_id, action, old_balance, new_balance, amount, metadata)
+         VALUES (?, 'cycle', ?, 'cycle_mancecoin_reward', ?, ?, ?, ?)`,
+        [parsedUserId, purchaseInsertResult.insertId, mancecoinOldBalance, mancecoinNewBalance, mancecoinReward, JSON.stringify({productId: parsedCycleProductId, productName: product.name})]
+      )
+    }
 
     await conn.query(
       `
@@ -10727,6 +11105,7 @@ const ensureCycleProductsTable = async () => {
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN min_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN max_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
   await tryAlter(`ALTER TABLE cycle_products ADD COLUMN profit_percent DECIMAL(8,4) NOT NULL DEFAULT 0.0000`)
+  await tryAlter(`ALTER TABLE cycle_products ADD COLUMN mancecoin_reward DECIMAL(12,2) NOT NULL DEFAULT 0.00`)
 }
 
 type CommissionLevelRequirementInput = {
@@ -16807,6 +17186,8 @@ app.get('/api/admin/users/:id/details', requireAdminLevelTwo, async (req, res) =
       `
     ).catch(() => null)
     await pool.query("ALTER TABLE users ADD COLUMN allow_referral_link TINYINT(1) NOT NULL DEFAULT 1").catch(() => null)
+    await pool.query("ALTER TABLE users ADD COLUMN ip_address VARCHAR(64) NULL DEFAULT NULL").catch(() => null)
+    await pool.query("ALTER TABLE users ADD COLUMN ip_location VARCHAR(128) NULL DEFAULT NULL").catch(() => null)
 
     const [userRows] = await pool.query<RowDataPacket[]>(
       `
@@ -16823,7 +17204,9 @@ app.get('/api/admin/users/:id/details', requireAdminLevelTwo, async (req, res) =
         COALESCE(recharge_balance, 0) AS rechargeBalance,
         COALESCE(commission_balance, 0) AS commissionBalance,
         COALESCE(telegram_conectado, 0) AS telegramConectado,
-        monthly_salary_contract AS activeContract
+        monthly_salary_contract AS activeContract,
+        ip_address AS ipAddress,
+        ip_location AS ipLocation
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -16976,15 +17359,32 @@ app.get('/api/admin/users/:id/details', requireAdminLevelTwo, async (req, res) =
       vipPurchases = []
     }
 
-    let cyclePurchases: Array<{ id: number; planName: string; amountPaid: number; createdAt: string | null }> = []
+    let cyclePurchases: Array<{
+      id: number
+      planName: string
+      amountPaid: number
+      expectedProfit: number
+      totalCredited: number
+      cycleDays: number
+      status: string
+      startedAt: string | null
+      endsAt: string | null
+      createdAt: string | null
+    }> = []
     try {
       const [cycleRowsDetailed] = await pool.query<RowDataPacket[]>(
         `
         SELECT
           ucp.id,
           COALESCE(cp.name, CONCAT('Plano #', ucp.cycle_product_id)) AS planName,
-          ucp.amount_paid AS amountPaid,
-          ucp.created_at AS createdAt
+          ucp.amount_paid    AS amountPaid,
+          ucp.expected_profit AS expectedProfit,
+          COALESCE(ucp.total_credited, 0) AS totalCredited,
+          ucp.cycle_days     AS cycleDays,
+          ucp.status,
+          ucp.started_at     AS startedAt,
+          ucp.ends_at        AS endsAt,
+          ucp.created_at     AS createdAt
         FROM user_cycle_purchases ucp
         LEFT JOIN cycle_products cp ON cp.id = ucp.cycle_product_id
         WHERE ucp.user_id = ?
@@ -16996,6 +17396,12 @@ app.get('/api/admin/users/:id/details', requireAdminLevelTwo, async (req, res) =
         id: Number(row.id),
         planName: String(row.planName ?? 'Plano de ciclo'),
         amountPaid: Number(row.amountPaid ?? 0),
+        expectedProfit: Number(row.expectedProfit ?? 0),
+        totalCredited: Number(row.totalCredited ?? 0),
+        cycleDays: Number(row.cycleDays ?? 0),
+        status: String(row.status ?? 'active'),
+        startedAt: row.startedAt ? String(row.startedAt) : null,
+        endsAt: row.endsAt ? String(row.endsAt) : null,
         createdAt: row.createdAt ? String(row.createdAt) : null,
       }))
     } catch {

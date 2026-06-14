@@ -1,5 +1,0 @@
-- [x] Inspecionar frontend de roulette probabilities para confirmar payload e método HTTP
-- [x] Validar implementação atual no backend para /api/admin/roulette-probabilities
-- [ ] Ajustar backend para compatibilidade e persistência no banco
-- [ ] Testar endpoints com curl (GET/PUT) cobrindo sucesso e erro principal
-- [ ] Commit e push das correções
