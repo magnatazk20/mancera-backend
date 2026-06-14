@@ -3865,7 +3865,7 @@ app.post('/api/shop/deposit', requireAuth, async (req: AuthenticatedRequest, res
       customerDocumentType: 'cpf',
       customerPhone:        (user.phone || '').replace(/\D/g, '') || '11999998888',
       description:          `Depósito loja TRK - usuário #${user.id}`,
-      callbackUrl:          `https://api.pgl-m.com/api/shop/deposit/webhook`,
+      callbackUrl:          `${BACKEND_URL}/api/shop/deposit/webhook`,
       metadata: { userId: user.id, source: 'loja' },
     }
 
