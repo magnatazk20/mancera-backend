@@ -4712,12 +4712,10 @@ app.get('/api/register/meta/:ref', async (req, res) => {
     const siteLogo = String(siteRows[0]?.siteLogoUrl ?? '')
     const siteTitle = String(siteRows[0]?.siteTitle ?? 'TRK')
 
-    const ogTitle = isPaidVip && vipName
-      ? `${inviterName} te convida para o VIP ${vipName} | ${siteTitle}`
-      : `${inviterName} te convida para a TRK | ${siteTitle}`
+    const ogTitle = `${inviterName} te convida para a Mancera!`
     const ogDescription = isPaidVip && vipName
-      ? `收到来自 VIP ${vipName} 的邀请。立即加入并享受独家福利！`
-      : `收到了一个邀请。立即加入 TRK 平台！`
+      ? `Você foi convidado para o plano ${vipName}. Registre-se agora e garante um bônus especial!`
+      : `Você recebeu um convite para a Mancera! Registre-se agora e garanta um bônus especial.`
 
     res.json({
       ok: true,
