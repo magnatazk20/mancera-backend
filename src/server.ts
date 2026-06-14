@@ -72,6 +72,7 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT     ?? 3333
 const JWT_SECRET   = process.env.JWT_SECRET   ?? 'fallback_secret'
 const JWT_EXPIRES  = process.env.JWT_EXPIRES_IN ?? '7d'
+const BACKEND_URL  = (process.env.BACKEND_URL ?? 'http://localhost:3333').replace(/\/+$/, '')
 const LUMO_API_KEY = 'pk_69aa7a3d1a07dffe750eb533c92fabbe87974479ed791fb7ead328a56e67143d'
 const LUMO_WEBHOOK_SECRET = 'sk_8910b90244b35ab56342bc3c019e569bb59abb9a90a7f69ad1dd59ce59ebd1065dc6240536d0a7b2e69496f8bac1dcdb739d22767183e2421b590f1fbfb77e39'
 const LUMOPAY_TRANSFER_URL = 'https://api.lumopayment.com/api/payments/transfers/pix'
@@ -3418,7 +3419,7 @@ app.post('/api/CASHIN/', async (req, res) => {
       customerDocumentType: 'cpf',
       customerPhone: normalizedPhone || '11999998888',
       description: `Depósito CASHIN - usuário #${user.id}`,
-      callbackUrl: 'https://appmniola.trk321.cc/api/CASHIN/webhook',
+      callbackUrl: `${BACKEND_URL}/api/CASHIN/webhook`,
       metadata: {
         userId: user.id,
         method: method ?? 'pix',
@@ -10572,7 +10573,7 @@ app.post('/api/withdraw/request', requireAuth, async (req: AuthenticatedRequest,
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX auto #${externalId}`,
-        callbackUrl: 'https://appmniola.trk321.cc/api/withdraw/webhook',
+        callbackUrl: `${BACKEND_URL}/api/withdraw/webhook`,
       }
 
       const providerRes = await fetch(LUMOPAY_TRANSFER_URL, {
@@ -15545,7 +15546,7 @@ app.post('/api/admin/withdrawals/:id/action', requireMaxAdmin, async (req: Authe
         pixKey: lumopayPixKey,
         pixKeyType: lumopayPixType,
         description: `Saque PIX #${withdrawalId}`,
-        callbackUrl: 'https://appmniola.trk321.cc/api/withdraw/webhook',
+        callbackUrl: `${BACKEND_URL}/api/withdraw/webhook`,
       }
 
       const lumopayAbort = new AbortController()
