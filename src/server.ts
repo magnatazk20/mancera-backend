@@ -1750,7 +1750,7 @@ app.use(cors({
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }))
-app.options('*', cors())
+app.options('/{*path}', cors())
 app.use(express.json({ limit: '10mb' }))
 
 // ─── Servir uploads estáticos ─────────────────────────────────────────────
