@@ -1744,7 +1744,13 @@ const settleExpiredCyclesForUser = async (userId: number) => {
   }
 }
 
-app.use(cors())
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+}))
+app.options('*', cors())
 app.use(express.json({ limit: '10mb' }))
 
 // ─── Servir uploads estáticos ─────────────────────────────────────────────
