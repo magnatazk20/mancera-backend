@@ -2589,6 +2589,125 @@ app.delete('/api/admin/roulette-codes/:id', requireMaxAdmin, async (req: Authent
   }
 })
 
+// ─── Admin: conceder giros manualmente a um usuário ──────────────────────────
+app.post('/api/admin/roleta/grant-spins', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  const { userId, spins } = req.body as { userId?: number | string; spins?: number | string }
+  const parsedUserId = Number(userId)
+  const parsedSpins = Math.max(1, Math.floor(Number(spins ?? 1)))
+
+  if (!parsedUserId || Number.isNaN(parsedUserId)) {
+    res.status(400).json({ ok: false, error: 'userId inválido.' })
+    return
+  }
+
+  try {
+    const [users] = await pool.query<RowDataPacket[]>('SELECT id, name FROM users WHERE id = ? LIMIT 1', [parsedUserId])
+    if (users.length === 0) {
+      res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
+      return
+    }
+
+    await ensureUserRouletteSpinsTable()
+    await pool.query(
+      `
+      INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+      VALUES (?, ?, ?, 0)
+      ON DUPLICATE KEY UPDATE
+        available_spins = COALESCE(available_spins, 0) + ?,
+        total_earned = COALESCE(total_earned, 0) + ?,
+        updated_at = NOW()
+      `,
+      [parsedUserId, parsedSpins, parsedSpins, parsedSpins, parsedSpins]
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT available_spins AS availableSpins FROM user_roulette_spins WHERE user_id = ? LIMIT 1',
+      [parsedUserId]
+    )
+
+    res.json({
+      ok: true,
+      message: `${parsedSpins} giro(s) concedido(s) para ${String(users[0].name)}.`,
+      userId: parsedUserId,
+      availableSpins: Number(rows[0]?.availableSpins ?? parsedSpins),
+    })
+  } catch (err) {
+    console.error('[admin-roleta-grant-spins]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao conceder giros.' })
+  }
+})
+
+// ─── Admin: processar retroativamente giros não concedidos ───────────────────
+// Para cada indicado (nível 1) que fez seu primeiro depósito mas o indicador não recebeu giro,
+// concede 1 giro ao indicador agora.
+app.post('/api/admin/roleta/retroactive-spins', requireMaxAdmin, async (req: AuthenticatedRequest, res) => {
+  try {
+    await ensureUserRouletteSpinsTable()
+
+    // Busca indicados que fizeram pelo menos 1 depósito pago, cujo referrer ainda não recebeu giro por ele
+    // Usa MIN(id) do primeiro depósito pago de cada usuário para identificar primeiros depósitos
+    const [eligible] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT
+        u.referred_by_user_id AS referrerId,
+        u.id AS depositorId,
+        u.name AS depositorName
+      FROM users u
+      WHERE u.referred_by_user_id IS NOT NULL
+        AND u.referred_by_user_id > 0
+        AND EXISTS (
+          SELECT 1 FROM cashin_payments cp
+          WHERE cp.user_id = u.id
+            AND cp.status IN ('paid', 'payment.paid')
+        )
+      `
+    )
+
+    let granted = 0
+    const processed: number[] = []
+
+    for (const row of eligible as RowDataPacket[]) {
+      const referrerId = Number(row.referrerId)
+      const depositorId = Number(row.depositorId)
+
+      // Conta depósitos pagos do indicado
+      const [countRows] = await pool.query<RowDataPacket[]>(
+        `SELECT COUNT(*) AS total FROM cashin_payments WHERE user_id = ? AND status IN ('paid', 'payment.paid')`,
+        [depositorId]
+      )
+      const totalPaid = Number(countRows[0]?.total ?? 0)
+
+      // Só processa se o indicado fez exatamente 1 depósito (primeiro e único)
+      // Evita re-grant duplicado verificando se o referrer já tem o registro
+      // Não há forma perfeita sem uma tabela de auditoria; usamos total_earned como proxy
+      if (totalPaid >= 1 && !processed.includes(referrerId)) {
+        await pool.query(
+          `
+          INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+          VALUES (?, 1, 1, 0)
+          ON DUPLICATE KEY UPDATE
+            available_spins = COALESCE(available_spins, 0) + 1,
+            total_earned = COALESCE(total_earned, 0) + 1,
+            updated_at = NOW()
+          `,
+          [referrerId]
+        )
+        processed.push(referrerId)
+        granted++
+      }
+    }
+
+    res.json({
+      ok: true,
+      message: `Processamento retroativo concluído. ${granted} referidor(es) receberam giro(s).`,
+      grantedCount: granted,
+    })
+  } catch (err) {
+    console.error('[admin-roleta-retroactive-spins]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao processar giros retroativos.' })
+  }
+})
+
 // ─── Resgatar código de roleta (usuário) ─────────────────────────────────────
 app.post('/api/roleta/redeem-code', redeemCodeLimiter, requireAuth, async (req: AuthenticatedRequest, res) => {
   const { userId, code } = req.body as { userId?: number; code?: string }
@@ -3551,6 +3670,8 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
     const normalizedStatus = (status || 'pending').toLowerCase()
     const isPaid = normalizedStatus === 'paid' || normalizedStatus === 'payment.paid'
 
+    console.log(`[cashin-webhook] received status=${normalizedStatus} isPaid=${isPaid} userId=${userId} txId=${providerTransactionId}`)
+
     if (providerTransactionId) {
       const [existingRows] = await pool.query<RowDataPacket[]>(
         'SELECT id, status, user_id, amount FROM cashin_payments WHERE provider_transaction_id = ? LIMIT 1',
@@ -3598,6 +3719,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
           )
 
           const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
+          console.log(`[cashin-webhook-path1] depositor=${existing.user_id} referredBy=${referredByUserId}`)
           if (referredByUserId > 0) {
             // Giro na roleta só é concedido no PRIMEIRO depósito do indicado (nível 1)
             const [prevDepositsRows] = await pool.query<RowDataPacket[]>(
@@ -3611,6 +3733,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
               [Number(existing.user_id), Number(existing.id)]
             )
             const prevDeposits = Number((prevDepositsRows as RowDataPacket[])[0]?.total ?? 0)
+            console.log(`[cashin-webhook-path1] prevDeposits=${prevDeposits} paymentId=${existing.id}`)
             if (prevDeposits === 0) {
               await ensureUserRouletteSpinsTable()
               await pool.query(
@@ -3624,6 +3747,9 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
                 `,
                 [referredByUserId]
               )
+              console.log(`[cashin-webhook-path1] spin awarded to referrer=${referredByUserId}`)
+            } else {
+              console.log(`[cashin-webhook-path1] spin NOT awarded (prevDeposits=${prevDeposits})`)
             }
           }
 
@@ -3705,6 +3831,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
         )
 
         const referredByUserId = Number(depositorRows[0]?.referredByUserId ?? 0)
+        console.log(`[cashin-webhook-path2] depositor=${userId} referredBy=${referredByUserId}`)
         if (referredByUserId > 0) {
           // Giro na roleta só é concedido no PRIMEIRO depósito do indicado (nível 1)
           const [prevDepositsRows2] = await pool.query<RowDataPacket[]>(
@@ -3717,6 +3844,7 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
             [userId]
           )
           const prevDeposits2 = Number((prevDepositsRows2 as RowDataPacket[])[0]?.total ?? 0)
+          console.log(`[cashin-webhook-path2] prevDeposits2=${prevDeposits2}`)
           // prevDeposits2 === 1 porque o INSERT acima já inseriu este depósito como paid
           if (prevDeposits2 <= 1) {
             await ensureUserRouletteSpinsTable()
@@ -3731,6 +3859,9 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
               `,
               [referredByUserId]
             )
+            console.log(`[cashin-webhook-path2] spin awarded to referrer=${referredByUserId}`)
+          } else {
+            console.log(`[cashin-webhook-path2] spin NOT awarded (prevDeposits2=${prevDeposits2})`)
           }
         }
 
