@@ -12084,7 +12084,11 @@ const applyReferralCommissionsForVipPurchase = async (
     let currentUserId = buyerUserId
     const beneficiaryIds: number[] = []
 
-    for (let level = 1; level <= 3; level += 1) {
+    let level = 1
+    let safetyLimit = 10 // evita loop infinito caso haja cadeia longa de T0
+    while (level <= 3 && safetyLimit > 0) {
+      safetyLimit -= 1
+
       const [uplineRows] = await conn.query<RowDataPacket[]>(
         `
         SELECT referred_by_user_id AS referredByUserId
@@ -12117,9 +12121,9 @@ const applyReferralCommissionsForVipPurchase = async (
       )
       const parentVipLevelId = Number(t0CheckRows[0]?.vipLevelId ?? 0)
       if (parentVipLevelId === 6) {
-        // T0-Estágio: não recebe comissão de VIP, mas continua subindo na árvore
+        // T0-Estágio: não recebe comissão de VIP, sobe na árvore sem consumir nível
         currentUserId = parentUserId
-        continue
+        continue // level NÃO incrementa — próximo upline elegível recebe o nível correto
       }
 
       const levelConfig = activeLevels.find((item) => item.level === level)
@@ -12196,6 +12200,7 @@ const applyReferralCommissionsForVipPurchase = async (
       }
 
       currentUserId = parentUserId
+      level += 1
     }
 
     await conn.commit()
