@@ -8628,6 +8628,94 @@ app.get('/api/team/vip-members/:userId', async (req, res) => {
   }
 })
 
+// Garante tabela de controle de giros por primeiro depósito de indicado
+const ensureReferralSpinsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS referral_first_deposit_spins (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      referrer_id BIGINT UNSIGNED NOT NULL,
+      depositor_id BIGINT UNSIGNED NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_referral_spin (referrer_id, depositor_id)
+    )
+  `)
+}
+
+// Verifica e concede giros de roleta pendentes para indicados nível 1 que já depositaram
+// Chamado quando o indicador abre a página da roleta (garante que webhook perdido seja recuperado)
+app.post('/api/roleta/sync-referral-spins', requireAuth, async (req: AuthenticatedRequest, res) => {
+  const userId = Number(req.authUser?.id ?? 0)
+  if (!userId) {
+    res.status(401).json({ ok: false, error: 'Não autenticado.' })
+    return
+  }
+  try {
+    await ensureReferralSpinsTable()
+    await ensureUserRouletteSpinsTable()
+
+    // Busca indicados nível 1 que fizeram pelo menos 1 depósito pago
+    // e ainda não geraram giro para este indicador
+    const [eligible] = await pool.query<RowDataPacket[]>(
+      `
+      SELECT u.id AS depositorId
+      FROM users u
+      WHERE u.referred_by_user_id = ?
+        AND EXISTS (
+          SELECT 1 FROM cashin_payments cp
+          WHERE cp.user_id = u.id
+            AND cp.status IN ('paid','payment.paid')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM referral_first_deposit_spins rfs
+          WHERE rfs.referrer_id = ? AND rfs.depositor_id = u.id
+        )
+      `,
+      [userId, userId]
+    )
+
+    let granted = 0
+    for (const row of eligible) {
+      const depositorId = Number(row.depositorId)
+      try {
+        await pool.query(
+          `INSERT IGNORE INTO referral_first_deposit_spins (referrer_id, depositor_id) VALUES (?, ?)`,
+          [userId, depositorId]
+        )
+        await pool.query(
+          `
+          INSERT INTO user_roulette_spins (user_id, available_spins, total_earned, total_used)
+          VALUES (?, 1, 1, 0)
+          ON DUPLICATE KEY UPDATE
+            available_spins = COALESCE(available_spins, 0) + 1,
+            total_earned    = COALESCE(total_earned, 0) + 1,
+            updated_at      = NOW()
+          `,
+          [userId]
+        )
+        granted++
+        console.log(`[sync-referral-spins] giro concedido referrer=${userId} depositor=${depositorId}`)
+      } catch (e) {
+        // IGNORE duplicado (INSERT IGNORE pode falhar em dup key sem lançar)
+        console.error('[sync-referral-spins] erro ao conceder giro', e)
+      }
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT available_spins AS availableSpins FROM user_roulette_spins WHERE user_id = ? LIMIT 1',
+      [userId]
+    )
+    res.json({
+      ok: true,
+      granted,
+      availableSpins: Number(rows[0]?.availableSpins ?? 0),
+    })
+  } catch (err) {
+    console.error('[sync-referral-spins]', err)
+    res.status(500).json({ ok: false, error: 'Erro ao sincronizar giros.' })
+  }
+})
+
 app.get('/api/roleta/spins-available/:userId', async (req, res) => {
   const userId = Number(req.params.userId)
 
