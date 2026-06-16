@@ -8005,6 +8005,12 @@ app.post('/api/cycle-products/purchase', requireAuth, async (req: AuthenticatedR
 
     await conn.commit()
 
+    // Distribuir comissões de referral para os uplines do comprador
+    const purchaseId = Number(purchaseInsertResult?.insertId ?? 0)
+    applyReferralCommissionsForVipPurchase(parsedUserId, amount, purchaseId).catch((err) => {
+      console.error('[cycle-product-commission]', err)
+    })
+
     res.json({
       ok: true,
       message: `Ciclo ${String(product.name ?? '')} adquirido com sucesso.`,
