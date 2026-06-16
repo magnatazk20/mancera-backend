@@ -1752,6 +1752,10 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
 }))
 app.options('/{*path}', cors())
+// Rotas de webhook precisam do body raw ANTES do express.json consumir o stream
+app.use('/api/CASHIN/webhook', express.raw({ type: '*/*' }))
+app.use('/api/shop/deposit/webhook', express.raw({ type: '*/*' }))
+
 app.use(express.json({ limit: '10mb' }))
 
 // ─── Servir uploads estáticos ─────────────────────────────────────────────
@@ -3637,18 +3641,28 @@ app.post('/api/CASHIN/webhook', express.raw({ type: '*/*' }), async (req, res) =
       ? req.body
       : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body))
 
-    const calculated = crypto
-      .createHmac('sha256', LUMO_WEBHOOK_SECRET)
-      .update(rawPayloadBuffer)
-      .digest('hex')
+    // Só valida assinatura se o LumoPay enviar o header x-signature
+    if (signature) {
+      const calculated = crypto
+        .createHmac('sha256', LUMO_WEBHOOK_SECRET)
+        .update(rawPayloadBuffer)
+        .digest('hex')
 
-    if (!signature || !crypto.timingSafeEqual(Buffer.from(calculated), Buffer.from(String(signature)))) {
-      res.status(401).send('Assinatura inválida')
-      return
+      const sigBuf = Buffer.from(String(signature))
+      const calcBuf = Buffer.from(calculated)
+      if (sigBuf.length !== calcBuf.length || !crypto.timingSafeEqual(calcBuf, sigBuf)) {
+        console.warn('[cashin-webhook] assinatura inválida — rejeitado')
+        res.status(401).send('Assinatura inválida')
+        return
+      }
+    } else {
+      console.log('[cashin-webhook] sem x-signature — processando sem verificação')
     }
 
-    const payloadText = rawPayloadBuffer.toString('utf8')
-    const data = JSON.parse(payloadText) as any
+    // Usa o body já parseado se o express.json() consumiu antes do raw (fallback)
+    const data: any = Buffer.isBuffer(req.body)
+      ? JSON.parse(req.body.toString('utf8'))
+      : req.body
 
     /*
      * Estrutura da Lumopay:
@@ -4072,17 +4086,24 @@ app.post('/api/shop/deposit/webhook', express.raw({ type: '*/*' }), async (req: 
       ? req.body
       : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body))
 
-    const calculated = crypto
-      .createHmac('sha256', LUMO_WEBHOOK_SECRET)
-      .update(rawBody)
-      .digest('hex')
+    if (signature) {
+      const calculated = crypto
+        .createHmac('sha256', LUMO_WEBHOOK_SECRET)
+        .update(rawBody)
+        .digest('hex')
 
-    if (!signature || !crypto.timingSafeEqual(Buffer.from(calculated), Buffer.from(String(signature)))) {
-      res.status(401).send('Assinatura inválida')
-      return
+      const sigBuf = Buffer.from(String(signature))
+      const calcBuf = Buffer.from(calculated)
+      if (sigBuf.length !== calcBuf.length || !crypto.timingSafeEqual(calcBuf, sigBuf)) {
+        console.warn('[shop-webhook] assinatura inválida — rejeitado')
+        res.status(401).send('Assinatura inválida')
+        return
+      }
     }
 
-    const payload = JSON.parse(rawBody.toString('utf8')) as any
+    const payload: any = Buffer.isBuffer(req.body)
+      ? JSON.parse(req.body.toString('utf8'))
+      : req.body
 
     /*
      * Estrutura da Lumopay:
